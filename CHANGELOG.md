@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.1.0
+## 1.0.2
 
 - **Refactor for token efficiency**: agent descriptions trimmed, instructions gated with `applyTo`, duplicated content extracted into on-demand skills and prompts. Idle-turn context drops from ~7.5K to ~1.4K tokens; full-pipeline context drops ~40–60%.
 - **New skills** (loaded on demand):

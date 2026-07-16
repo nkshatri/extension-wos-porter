@@ -1,0 +1,306 @@
+version: "1.0"
+generated_from: skills/asm-x64-to-arm64/references/specs/lzma-dec-port.md
+description: >
+  Worked-example patterns from the upstream 7-zip LzmaDecOpt arm64 port
+  (Asm/x86/LzmaDecOpt.asm → Asm/arm64/LzmaDecOpt.S, by Igor Pavlov). Captures
+  reusable techniques for porting large MASM x64 hot loops where keeping the
+  body diff-readable against the x64 source has high review value: macro shim
+  layers, PSHIFT-style data-width abstraction, GPR-pressure register aliasing,
+  C-side calling-convention contract, Windows-on-ARM64 toolchain selection,
+  build-system asm/C selection, verification checklist, and translation
+  difficulty hot spots.
+
+specs:
+  - id: 1
+    name: 7zasm-macro-shim-layer
+    category: macro-idiom
+    description: >
+      Define register aliases (r0..r30 → x0..x30) and x86-mnemonic macros
+      (xor/shl/shr/sar/imul/inc/dec) that emit arm64 instructions. p2_ prefix
+      = "produces 2-operand x86 form" (3-op arm64 with reg reuse); p1_ = "1-op";
+      _s suffix = flag-setting variant. Keeps the body textually similar to the
+      x64 source for diff-locality.
+    metadata:
+      match_rules:
+        - pattern: "#define\\s+r\\d+\\s+x\\d+"
+          type: regex
+          scope: preprocessor
+          description: 7zAsm-style register alias mapping rN → xN
+        - pattern: "\\.macro\\s+(p1|p2)_\\w+"
+          type: regex
+          scope: directive
+          description: 2-op-via-macro shim definition with p1_/p2_ prefix
+        - pattern: "\\.macro\\s+\\w+_s\\b"
+          type: regex
+          scope: directive
+          description: Flag-setting macro variant (_s suffix)
+    x64_constructs:
+      - "xor reg, param"
+      - "shl reg, param"
+      - "p2_add reg, param           ; conceptual x86 2-op shape"
+    arm64_constructs:
+      - "#define r0 x0 ... #define r30 x30"
+      - ".macro xor reg:req, param:req\\n        eor \\reg, \\reg, \\param\\n.endm"
+      - ".macro p2_sub_s reg:req, param:req\\n        subs \\reg, \\reg, \\param\\n.endm"
+    pitfalls:
+      - Shim is documentation aid for diff-readability, NOT a portability layer — does not buy any architecture neutrality
+      - Body needing flags must use _s variants; plain p2_ macros emit non-flag-setting forms
+      - cmov<cc> macro fixes srcFalse = dest — genuine 3-way selects must call csel directly
+      - Carry-condition mnemonics (jb/jae) hide the inverted-flag pitfall — document near the macro definitions
+    validation_criteria:
+      - Macros prefixed p2_ always have form `op \\reg, \\reg, \\param`
+      - Macros with _s suffix use flag-setting instructions (adds, subs, ands)
+      - Inverted-carry pitfall is documented near the cmov/jb macros
+
+  - id: 2
+    name: pshift-data-width-abstraction
+    category: macro-idiom
+    description: >
+      LZMA probability table is 16-bit by default, 32-bit under _LZMA_PROB32.
+      Abstract loads/stores via PLOAD/PSTORE/PLOAD_LSL/etc. macros plus PSHIFT
+      / PMULT .equ constants so the inner-loop body does not fork on element
+      width. Generally reusable for any algorithm with switchable element width.
+    metadata:
+      match_rules:
+        - pattern: "#ifdef\\s+_LZMA_PROB32"
+          type: regex
+          scope: preprocessor
+          description: LZMA probability-width compile-time switch
+        - pattern: "\\.macro\\s+(PLOAD|PSTORE|PLOAD_LSL|PSTORE_LSL|PLOAD_2|PSTORE_2|PSTORE_LSL_M1)\\b"
+          type: regex
+          scope: directive
+          description: PSHIFT-family load/store macro definition
+        - pattern: "\\.equ\\s+P(SHIFT|MULT|MULT_2)\\b"
+          type: regex
+          scope: directive
+          description: PSHIFT/PMULT constant definitions
+    x64_constructs:
+      - "movzx reg, word ptr [mem]    ; 16-bit prob load"
+      - "mov reg, dword ptr [mem]      ; 32-bit prob load (_LZMA_PROB32)"
+    arm64_constructs:
+      - ".equ PSHIFT, 1                  ; 16-bit default"
+      - ".macro PLOAD dest:req, mem:req\\n        ldrh \\dest, [\\mem]\\n.endm"
+      - ".equ PSHIFT, 2                  ; 32-bit (_LZMA_PROB32)"
+      - ".macro PLOAD dest:req, mem:req\\n        ldr \\dest, [\\mem]\\n.endm"
+    pitfalls:
+      - PSTORE_LSL_M1 emulates [mem1, mem2, lsl #-1] which has no native form — must use add temp = mem1+mem2 then str at [temp, mem2]
+      - Macro NAMES are project convention; the technique (abstract element width) is the reusable part
+    validation_criteria:
+      - All probability accesses go through PLOAD/PSTORE family — no raw ldr/ldrh in the inner loop
+      - PSHIFT and PMULT switch consistently under #ifdef _LZMA_PROB32
+
+  - id: 3
+    name: gpr-pressure-register-aliasing
+    category: register-allocation
+    description: >
+      Inner loops at GPR-pressure limit benefit from a top-of-file register-
+      purpose comment block plus #define aliases that give each physical
+      register multiple names corresponding to the role it plays in different
+      code phases. _R suffix marks the 64-bit (xN) form for address arithmetic.
+    metadata:
+      match_rules:
+        - pattern: "#define\\s+\\w+\\s+w\\d+\\s*$"
+          type: regex
+          scope: preprocessor
+          description: 32-bit (wN) role-named register alias
+        - pattern: "#define\\s+\\w+_R\\s+r\\d+\\s*$"
+          type: regex
+          scope: preprocessor
+          description: 64-bit (rN/xN) role-named register alias with _R suffix
+    x64_constructs:
+      - "; inner-loop register pressure is dispersed across phases LITM/TREE/NORM_CALC"
+    arm64_constructs:
+      - "#define range   w0"
+      - "#define pbPos     w1"
+      - "#define pbPos_R   r1"
+      - "#define prob_reg  w1   ; same physical register as pbPos, different phase"
+    pitfalls:
+      - Multiple aliases for one register is intentional — review each phase boundary to confirm the prior role's value is dead
+      - _R-suffix pointer alias must be paired with the non-suffix 32-bit alias for the same physical register
+    validation_criteria:
+      - Top-of-file comment block documents physical register → role mapping per phase
+      - Aliases are #defined consistently; no raw register names in the body when an alias exists
+
+  - id: 4
+    name: c-side-calling-convention-contract
+    category: integration
+    description: >
+      LzmaDec_DecodeReal_3 is co-designed with LzmaDec.c — function name suffix
+      (_3) link-time-checks the version, CLzmaDec struct field offsets must
+      match what the C compiler produces, _LZMA_PROB32 macro selects the same
+      probs layout on both sides, and AAPCS64 first 8 args (x0-x7) match
+      Windows AAPCS64 and SysV AAPCS64 unchanged.
+    metadata:
+      match_rules:
+        - pattern: "\\bLzmaDec_DecodeReal_\\d+\\b"
+          type: regex
+          scope: function_call
+          description: LzmaDec versioned-symbol reference (asm/C contract)
+        - pattern: "\\.equ\\s+(\\w+_offset|offsetof_)"
+          type: regex
+          scope: directive
+          description: Struct-offset .equ derived from offsetof()
+    x64_constructs:
+      - "LzmaDec_DecodeReal_3 PROC    ; MASM symbol matching LZMA_DEC_REAL_VER"
+    arm64_constructs:
+      - "#ifdef __APPLE__\\n  .globl _LzmaDec_DecodeReal_3\\n#else\\n  .global LzmaDec_DecodeReal_3\\n#endif"
+      - ".equ kRange_offset, 0x40    ; verified via clang -S LzmaDec.c"
+    pitfalls:
+      - Bumping the asm version requires bumping LZMA_DEC_REAL_VER in LzmaDec.c — link-time mismatch otherwise
+      - CLzmaDec struct field offsets must be verified with clang -S on the SAME arm64 target — alignment may differ from x64
+      - _LZMA_PROB32 must be defined consistently on both C and asm sides
+    validation_criteria:
+      - .equ struct offsets are verified against clang -S LzmaDec.c output for the target
+      - Function name suffix matches LZMA_DEC_REAL_VER in C source
+      - First-8-args register binding documented (x0=p, x1=limit, x2=bufLimit, ...)
+
+  - id: 5
+    name: windows-on-arm64-toolchain
+    category: build-system
+    description: >
+      Microsoft armasm64.exe cannot consume GAS-syntax .S files (Microsoft-
+      specific dialect closer to ARMASM, separate MACRO/MEND, no .equ).
+      Default to clang integrated assembler so the same .S works on Linux,
+      Apple, and Windows-on-ARM64.
+    metadata:
+      match_rules:
+        - pattern: "armasm64\\.exe"
+          type: regex
+          scope: directive
+          description: Microsoft armasm64 invocation (incompatible with GAS)
+        - pattern: "clang\\s+-c\\s+--target=aarch64"
+          type: regex
+          scope: directive
+          description: clang integrated assembler invocation
+    x64_constructs:
+      - "ml64.exe /c LzmaDecOpt.asm    ; x64 build"
+    arm64_constructs:
+      - "clang -c --target=aarch64-pc-windows-msvc LzmaDecOpt.S -o LzmaDecOpt.o"
+      - "clang -c --target=aarch64-linux-gnu LzmaDecOpt.S -o LzmaDecOpt.o"
+      - "clang -c --target=arm64-apple-darwin LzmaDecOpt.S -o LzmaDecOpt.o"
+    pitfalls:
+      - armasm64 dialect uses MACRO/MEND, different label rules, no .equ — feeding a GAS .S produces unreadable error cascades
+    validation_criteria:
+      - All three target triples (Linux/Apple/Windows-on-ARM64) build the same .S file with clang
+      - No armasm64.exe invocation against a GAS-syntax source
+
+  - id: 6
+    name: build-system-asm-c-selection
+    category: build-system
+    description: >
+      makefile picks asm vs C path via USE_*_ASM. Add a parallel ifdef
+      USE_ARM64_ASM branch pointing at Asm/arm64/LzmaDecOpt.S. The C file
+      LzmaDec.c is STILL compiled — it provides surrounding glue
+      (LzmaDec_TryDummy, LzmaDec_AllocateProbs2, init code); only
+      LzmaDec_DecodeReal_3 is replaced by the asm symbol.
+    metadata:
+      match_rules:
+        - pattern: "ifdef\\s+USE_(X86|ARM64)_ASM"
+          type: regex
+          scope: directive
+          description: Build-system asm-vs-C selection conditional
+        - pattern: "Z7_LZMA_DEC_OPT"
+          type: regex
+          scope: preprocessor
+          description: C-side compile flag enabling C optimized decoder
+    x64_constructs:
+      - "ifdef USE_X86_ASM\\n$O/LzmaDecOpt.o: ../../../../Asm/x86/LzmaDecOpt.asm\\n        $(MY_ASM) $(AFLAGS) $<\\nelse\\n$O/LzmaDec.o: ../../../../C/LzmaDec.c\\n        $(CC) $(CFLAGS) -DZ7_LZMA_DEC_OPT $<\\nendif"
+    arm64_constructs:
+      - "ifdef USE_ARM64_ASM\\n$O/LzmaDecOpt.o: ../../../../Asm/arm64/LzmaDecOpt.S\\n        $(CC) -c --target=$(TARGET_TRIPLE) $<\\nelse\\n$O/LzmaDec.o: ../../../../C/LzmaDec.c\\n        $(CC) $(CFLAGS) -DZ7_LZMA_DEC_OPT $<\\nendif"
+    pitfalls:
+      - LzmaDec.c is still compiled in the asm branch — it provides surrounding glue (TryDummy, AllocateProbs2, init); only DecodeReal_3 is replaced
+      - Must define -DZ7_LZMA_DEC_OPT in C-fallback path AND must NOT define it in asm path (the asm symbol replaces what that flag would build)
+    validation_criteria:
+      - USE_ARM64_ASM ifdef wraps a single .o rule pointing at the .S file
+      - LzmaDec.c is in the build dependency list regardless of branch
+      - nm output shows LzmaDec_DecodeReal_3 from the asm object, not the C object, when asm branch is taken
+
+  - id: 7
+    name: verification-checklist
+    category: testing
+    description: >
+      Standard verification gates after porting LzmaDecOpt: link succeeds with
+      asm symbol, archive interop with x64 builds, benchmark MIPS rating ≥ 110%
+      of arm64-C-only, fuzz round-trip bit-identical to C reference.
+    metadata:
+      match_rules:
+        - pattern: "7zz\\s+(t|b|x)\\b"
+          type: regex
+          scope: instruction
+          description: 7zz test/benchmark/extract command
+        - pattern: "nm\\s+.*\\|\\s*grep\\s+LzmaDec"
+          type: regex
+          scope: instruction
+          description: nm/grep symbol verification command
+    x64_constructs:
+      - "; x64 build: 7zz b -mm=lzma2:x5 baseline"
+    arm64_constructs:
+      - "nm 7zz.exe | grep LzmaDec_DecodeReal_3   ; should resolve to .S object"
+      - "7zz t corpus.7z                          ; functional test"
+      - "7zz b -mm=lzma2:x5                       ; ≥ 110% of arm64 C-only"
+      - "fuzz random LZMA2 streams; output bit-identical to C reference"
+    pitfalls:
+      - If asm path is not faster than C, the port likely has redundant flag-setting (S-suffix where not needed) or missed pre/post-indexed addressing
+      - Cross-arch interop test (x64-produced archive on arm64 build) catches struct-layout mismatches
+    validation_criteria:
+      - Link succeeds; nm shows LzmaDec_DecodeReal_3 from asm object
+      - Cross-arch archive test passes
+      - Benchmark MIPS rating ≥ 110% of arm64-C-only build
+      - Fuzz output bit-identical to C reference
+
+  - id: 8
+    name: translation-difficulty-hot-spots
+    category: idioms
+    description: >
+      Idioms in the LZMA decoder body that are NOT covered by the simple
+      xor/shl macro shim and require explicit arm64 thinking: cmov on carry,
+      shift-right-double, sub-with-borrow flag polarity, bit-test-and-branch
+      collapse, lea with scale+disp, short rep movsb, and partial-register
+      access (ax vs eax).
+    metadata:
+      match_rules:
+        - pattern: "\\bcmov(b|c)\\b"
+          type: regex
+          scope: instruction
+          description: x64 conditional move on carry — needs csel + flag-polarity awareness
+        - pattern: "\\bshrd\\b"
+          type: regex
+          scope: instruction
+          description: x64 shift-right-double — extr (immediate) or triplet (variable)
+        - pattern: "\\bsbb\\b"
+          type: regex
+          scope: instruction
+          description: x64 sub-with-borrow — sbcs with inverted carry polarity
+        - pattern: "\\bbt\\b.*\\n\\s*j[c|nc]\\b"
+          type: regex
+          scope: instruction
+          description: bt+jc pattern — collapses to tbnz
+        - pattern: "\\b(ax|cx|dx|bx|si|di|sp|bp)\\b"
+          type: regex
+          scope: instruction
+          description: x64 16-bit partial register access (ax vs eax) — ubfx/uxth
+    x64_constructs:
+      - "cmovb rax, rbx                ; cond move on carry"
+      - "shrd rax, rdx, cl              ; shift-right-double, variable"
+      - "sbb rax, rbx                   ; sub with borrow"
+      - "bt reg, imm; jc .L"
+      - "lea rax, [rsi + rdx*4 + 8]"
+      - "rep movsb (≤ 16 bytes short copy)"
+      - "movzx eax, ax                  ; partial-register zero-extend"
+    arm64_constructs:
+      - "csel x0, x1, x0, lo            ; single instruction, no flag dep on fall-through"
+      - "extr x0, xH, xL, #imm  OR  lsr+lsl+orr triplet with count=0 guard"
+      - "sbcs x0, x0, x1                ; arm64 C=1 means NO borrow — invert via cset+sub if read as value"
+      - "tbnz reg, #imm, .L             ; single instruction, much cheaper"
+      - "add x0, x1, x2, lsl #2; add x0, x0, #8   ; two instructions"
+      - "ldp x_, x_, [src], #16; stp x_, x_, [dst], #16   ; for 16-byte aligned"
+      - "ubfx w0, w0, #0, #16  OR  uxth w0, w0    ; no register subname"
+    pitfalls:
+      - cmovb→csel: pick csel operand order to avoid creating false flag dependency on the fall-through path
+      - sbb→sbcs polarity inversion is the #1 bug in multi-precision arithmetic ports
+      - bt+jc → tbnz only works for in-range branch targets (±32 KB); fall back to tst+b.<cc> for far targets
+      - lea with scale+disp ALWAYS expands to two instructions on arm64 — expect 1.5x-2x instruction count for memory-heavy code
+    validation_criteria:
+      - Every cmov<cc>→csel decision documented (which source is dest pass-through)
+      - sbb chains carry their polarity-inversion handling explicitly
+      - bt+j<cc> patterns translated to tbz/tbnz where range permits

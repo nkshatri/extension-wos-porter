@@ -1,0 +1,324 @@
+version: "1.0"
+generated_from: skills/sse-avx-to-neon/references/specs/neon-performance-patterns.md
+description: >
+  ARM NEON performance patterns for hand-written kernels — loop unrolling
+  to 64B/iter, deferred multiply for weighted sums, multiple independent
+  accumulators for ILP, alignment preamble, separate hot-path functions
+  for copy vs non-copy paths. Also covers zlib-ng project-specific wrappers.
+
+specs:
+  - id: 1
+    name: loop-unroll-64-bytes-per-iter
+    category: performance-loop
+    description: >
+      A 16B/iter NEON loop cannot saturate ARM's 2–4 SIMD execution units
+      and dual-issue load pipeline. Unroll to 64B/iter (four 16-byte
+      vectors) so the OoO engine has enough independent work and the
+      hardware prefetcher sees a coarse stride. Use vld1q_<type>_x4 for
+      non-copy paths; use four separate vld1q for copy paths to preserve ILP.
+    metadata:
+      match_rules:
+        # --- x86 SOURCE triggers (screened against the INPUT being ported) ---
+        # These fire on the SSE/AVX hot-loop body so the spec surfaces during
+        # screening. Without an x86-source trigger this spec can NEVER match,
+        # because the screener reads x86 input, not the NEON output.
+        - pattern: "_mm(256|512)?_load(u)?_si(128|256|512)\\s*\\("
+          type: regex
+          scope: intrinsic_call
+          description: SSE/AVX vector load in a hot loop — candidate for 64B/iter NEON unroll
+        - pattern: "_mm(256|512)?_storeu?_si(128|256|512)\\s*\\("
+          type: regex
+          scope: intrinsic_call
+          description: SSE/AVX vector store in a hot loop
+        # --- NEON OUTPUT self-check rules (used when reviewing produced ARM code) ---
+        - pattern: "vld1q_(u8|s8|u16|s16|u32|s32|f32)\\b"
+          type: regex
+          scope: intrinsic_call
+          description: Single 16-byte NEON load (candidate for unrolling)
+        - pattern: "vld1q_(u8|s8|u16|s16|u32|s32|f32)_x[24]"
+          type: regex
+          scope: intrinsic_call
+          description: Wide struct load already in use (good)
+    x64_constructs:
+      - "16B/iter SSE loop: _mm_loadu_si128 + ops + _mm_storeu_si128 in body"
+      - "32B/iter AVX2 loop: _mm256_loadu_si256 in body"
+    arm64_constructs:
+      - "uint8x16x4_t d0_d3 = vld1q_u8_x4(buf); buf += 64;  # non-copy hot loop"
+      - "Four separate vld1q_u8 + vst1q_u8 calls for copy hot loops"
+      - "uint16x8x4_t chunk = vld1q_u16_x4(table); chunk.val[i] = ...; vst1q_u16_x4(table, chunk)"
+    pitfalls:
+      - Do NOT use _x4 for copy paths — interleaved stores block ILP
+      - Do NOT unroll to less than 64B/iter on ARM — execution units stay idle
+      - Forward iteration only — backward iteration prevents prefetcher pattern detection
+    validation_criteria:
+      - Hot loop processes >= 64 bytes per iteration
+      - Non-copy loops use vld1q_<type>_x4 / vst1q_<type>_x4 struct intrinsics
+      - Copy loops use four independent vld1q + vst1q calls
+
+  - id: 2
+    name: deferred-multiply-for-weighted-sums
+    category: performance-arithmetic
+    description: >
+      Never multiply inside a hot loop that computes Σ weight[i]*b[i].
+      Accumulate raw byte sums into uint16x8_t lanes with cheap widening
+      adds (vaddw_u8 / vaddw_high_u8) and apply weights once after the loop
+      with vmlal_u16 / vmlal_high_u16. Verify uint16 cannot overflow:
+      iterations × max_byte × lanes_per_acc < 65535.
+    metadata:
+      match_rules:
+        # --- x86 SOURCE triggers: the weighted-sum idiom in SSE/AVX ---
+        # _mm_maddubs_epi16 / _mm_madd_epi16 / VPMADDUBSW are the per-iteration
+        # multiplies that MUST be deferred on ARM. Firing on these surfaces the
+        # spec for adler32, dot-product, and any Σ weight[i]*b[i] kernel.
+        - pattern: "_mm(256|512)?_madd(ubs)?_epi16\\s*\\("
+          type: regex
+          scope: intrinsic_call
+          description: SSE/AVX in-loop multiply-add for weighted sums — must become deferred vaddw + post-loop vmlal on ARM
+        - pattern: "_mm(256|512)?_sad_epu8\\s*\\("
+          type: regex
+          scope: intrinsic_call
+          description: SAD byte-sum accumulator (adler32 vs1) — pairs with the deferred-multiply weighted path
+        - pattern: "_mm(256|512)?_dpbusd(s)?_epi32\\s*\\("
+          type: regex
+          scope: intrinsic_call
+          description: VNNI dot-product (AVX512-VNNI) — on ARM defer to vdot/vmlal post-loop, do not multiply per iteration
+        # --- NEON OUTPUT self-check rules ---
+        - pattern: "vmull_u8|vmlal_u8"
+          type: regex
+          scope: intrinsic_call
+          description: 8-bit multiply intrinsics — flag if used inside a hot loop
+        - pattern: "vaddw_u8|vaddw_high_u8"
+          type: regex
+          scope: intrinsic_call
+          description: Widening add — preferred in-loop pattern for byte accumulation
+        - pattern: "vmlal_u16|vmlal_high_u16"
+          type: regex
+          scope: intrinsic_call
+          description: 16→32 widening multiply-accumulate — preferred post-loop pattern
+    x64_constructs:
+      - "_mm_madd_epi16 inside hot loop"
+      - "Σ weight[i] * b[i] with multiply per iteration"
+    arm64_constructs:
+      - "In loop: s2_lo = vaddw_u8(s2_lo, vget_low_u8(d0)); s2_hi = vaddw_high_u8(s2_hi, d0)"
+      - "After loop: acc = vmlal_u16(acc, vget_low_u16(weights), vget_low_u16(s2_lo))"
+      - "After loop: acc = vmlal_high_u16(acc, weights, s2_lo)"
+    pitfalls:
+      - uint16 overflow check is mandatory — iterations × max_byte × lanes < 65535
+      - Do NOT do vmull_u8 inside the loop — it serializes execution
+      - Order matters — only defer if weights are constant per output element
+    validation_criteria:
+      - Hot loop body contains vaddw, not vmull / vmlal
+      - Single weighted-sum vmlal pass after the loop
+      - uint16 overflow bound documented or commented near accumulator decl
+
+  - id: 3
+    name: multiple-independent-accumulators
+    category: performance-arithmetic
+    description: >
+      A single accumulator serializes the hot loop — each iteration waits
+      for the previous add to complete. Split into 4 independent
+      uint32x4_t accumulators that the CPU can issue in parallel, then
+      reduce them once at the end with two pairs of vaddq.
+    metadata:
+      match_rules:
+        # --- x86 SOURCE triggers: any vectorized accumulator loop ---
+        # A reduction/accumulator written for SSE/AVX almost always uses a single
+        # __m128i/__m256i accumulator; on ARM that single chain serializes the
+        # narrower NEON pipeline. Fire on the accumulating add so the spec is
+        # offered whenever an x86 reduction loop is being ported.
+        - pattern: "_mm(256|512)?_add_epi(8|16|32|64)\\s*\\("
+          type: regex
+          scope: intrinsic_call
+          description: SSE/AVX accumulating add — split into ≥4 independent NEON accumulators for ILP
+        - pattern: "__m(128|256|512)i\\s+\\w*acc\\w*"
+          type: regex
+          scope: declaration
+          description: Single x86 accumulator variable — candidate for 4-way split on ARM
+        # --- NEON OUTPUT self-check rules ---
+        - pattern: "uint32x4_t\\s+acc\\b"
+          type: regex
+          scope: declaration
+          description: Single accumulator declaration (candidate for splitting)
+        - pattern: "vaddq_u32\\(acc,"
+          type: regex
+          scope: intrinsic_call
+          description: Single-accumulator add chain (serializes execution)
+    x64_constructs:
+      - "Single SSE/AVX accumulator with serial chain inside loop"
+    arm64_constructs:
+      - "uint32x4_t acc0 = vdupq_n_u32(0); uint32x4_t acc1 = vdupq_n_u32(0); ..."
+      - "4 independent vmlal_u16 / vaddq_u32 chains in loop body"
+      - "Final reduction: acc = vaddq_u32(vaddq_u32(acc0, acc1), vaddq_u32(acc2, acc3))"
+    pitfalls:
+      - Fewer than 4 accumulators leaves SIMD execution units idle on most ARM cores
+      - Reduction step adds latency at end — only worth it for loops > 16 iterations
+      - All accumulators must be initialised to zero (vdupq_n_u32(0))
+    validation_criteria:
+      - 4 independent accumulator variables in hot loop
+      - Loop body has 4 parallel update chains
+      - Tree-reduction at end with two pairs of vaddq
+
+  - id: 4
+    name: alignment-preamble-before-simd-loop
+    category: performance-memory
+    description: >
+      Process unaligned head bytes with scalar code before entering the
+      SIMD loop, so the loaded pointer is aligned to 16 or 32 bytes. This
+      avoids cacheline-crossing penalties for the rest of the loop.
+    metadata:
+      match_rules:
+        # --- x86 SOURCE triggers: aligned-load idiom or explicit align peeling ---
+        # SSE/AVX code that uses _mm_load_si128 (aligned) or builds an alignment
+        # peel signals that an ARM alignment preamble should be reproduced. (x86
+        # tolerates unaligned access far better than some ARM cores / _ex hints.)
+        - pattern: "_mm(256|512)?_load_si(128|256|512)\\s*\\("
+          type: regex
+          scope: intrinsic_call
+          description: SSE/AVX ALIGNED load — implies the source aligns its pointer; reproduce the preamble on ARM
+        - pattern: "ALIGN_DIFF\\b"
+          type: exact
+          scope: function_call
+          description: Project-specific alignment-difference macro (zlib-ng)
+        - pattern: "vld1q_.*_ex\\b"
+          type: regex
+          scope: intrinsic_call
+          description: Project _ex alignment-hint variant — must be preceded by aligned pointer
+    x64_constructs:
+      - "Direct vectorized loop with no alignment handling (x86 tolerates unaligned access)"
+    arm64_constructs:
+      - "size_t head = (-(uintptr_t)src) & 15;  # bytes to next 16-byte boundary"
+      - "head = head < len ? head : len;"
+      - "for (size_t i = 0; i < head; i++) scalar_process(src[i]);"
+      - "src += head; len -= head;  # then enter SIMD loop with aligned src"
+    pitfalls:
+      - Mask is `& (alignment - 1)` — use 15 for 16-byte, 31 for 32-byte alignment
+      - Negate the pointer first, then mask — `(-(uintptr_t)src) & 15` not `(uintptr_t)src & 15`
+      - len must be clamped — head cannot exceed remaining length
+      - _ex alignment-hint variants must only be used after preamble guarantees alignment
+    validation_criteria:
+      - Preamble computes head via `(-(uintptr_t)src) & (alignment - 1)`
+      - len is reduced by head before entering SIMD loop
+      - SIMD loop pointer starts at aligned boundary
+
+  - id: 5
+    name: separate-functions-copy-vs-noncopy
+    category: performance-loop
+    description: >
+      An if (copy) branch inside the SIMD hot loop adds branch prediction
+      pressure and prevents the compiler from optimizing each path
+      independently. Provide two separate inner functions and branch once
+      outside the loop.
+    metadata:
+      match_rules:
+        # The copy-vs-non-copy branch reads the same in x86 source and ARM output,
+        # so this single rule fires at both screening and review time.
+        - pattern: "if\\s*\\(\\s*copy\\s*\\)"
+          type: regex
+          scope: expression
+          description: Inline copy branch — flag if inside a SIMD hot loop
+        - pattern: "_mm(256|512)?_storeu?_si(128|256|512)\\s*\\(\\s*(out|dst|d)\\b"
+          type: regex
+          scope: intrinsic_call
+          description: Conditional store to a dst/out pointer inside a compute loop — split copy/non-copy paths on ARM
+    x64_constructs:
+      - "Single function with `if (copy) { store } else { skip }` inside hot loop"
+    arm64_constructs:
+      - "static void process_neon(uint32_t* s, const uint8_t* buf, size_t blocks);  # non-copy"
+      - "static void process_neon_copy(uint32_t* s, uint8_t* dst, const uint8_t* buf, size_t blocks);"
+      - "if (copy) process_neon_copy(...); else process_neon(...);  # branch outside loop"
+    pitfalls:
+      - Do not duplicate logic — share a header-only inline helper for the SIMD math
+      - The two functions should differ only in store path, not in load or compute
+      - Branch outside the function call boundary, not just outside the loop
+    validation_criteria:
+      - Two separate inner functions exist for copy and non-copy paths
+      - Branch on `copy` is at the call site, not inside the SIMD loop
+      - SIMD math is shared via inline helper or duplicated identically
+
+  - id: 6
+    name: zlibng-ex-alignment-hint
+    category: project-specific
+    description: >
+      zlib-ng's neon_intrins.h defines _ex suffixed wrappers that accept an
+      alignment hint in bits (e.g., 256 = 32 bytes). Use only when the
+      pointer is genuinely aligned to that boundary — typically after an
+      alignment preamble. Do not use outside zlib-ng.
+    metadata:
+      match_rules:
+        - pattern: "vld1q_[a-z0-9]+_x[234]_ex\\b"
+          type: regex
+          scope: intrinsic_call
+          description: zlib-ng _ex alignment-hint load wrapper
+        - pattern: "vst1q_[a-z0-9]+_x[234]_ex\\b"
+          type: regex
+          scope: intrinsic_call
+          description: zlib-ng _ex alignment-hint store wrapper
+    x64_constructs:
+      - "(none — _ex variants are NEON-only project wrappers)"
+    arm64_constructs:
+      - "uint8x16x4_t d0_d3 = vld1q_u8_x4_ex(buf, 256);  # 256-bit = 32-byte alignment"
+      - "vst1q_u8_x4_ex(dst, d0_d3, 256);"
+    pitfalls:
+      - _ex variants are zlib-ng specific — using them in another project is a build error
+      - Lying about the alignment causes silent perf loss or trap on strict cores
+      - Hint value is in bits, not bytes — 256 means 32-byte boundary
+    validation_criteria:
+      - _ex variants only used in zlib-ng or projects that vendor neon_intrins.h
+      - Pointer aligned to the hint boundary (verified by preceding preamble)
+      - Hint value matches actual pointer alignment
+
+  - id: 7
+    name: zlibng-align-diff-and-optimal-cmp
+    category: project-specific
+    description: >
+      ALIGN_DIFF and OPTIMAL_CMP are zlib-ng internal macros for alignment
+      preamble handling and copy-path hardware capability dispatch. Do not
+      port these outside zlib-ng; reproduce the patterns inline if needed.
+    metadata:
+      match_rules:
+        - pattern: "\\bALIGN_DIFF\\b"
+          type: exact
+          scope: function_call
+          description: zlib-ng alignment-difference macro
+        - pattern: "\\bOPTIMAL_CMP\\b"
+          type: exact
+          scope: directive
+          description: zlib-ng hardware-capability dispatch macro
+    x64_constructs:
+      - "(none — these are zlib-ng internal macros, not standard C)"
+    arm64_constructs:
+      - "size_t align_diff = MIN(ALIGN_DIFF(src, 32), len);  # zlib-ng alignment preamble"
+      - "#if OPTIMAL_CMP >= 32 ... #else ... #endif  # capability dispatch"
+    pitfalls:
+      - Outside zlib-ng these macros are undefined — replace with explicit alignment math
+      - OPTIMAL_CMP gates copy-vs-no-copy fallback strategy — preserve both branches when porting
+    validation_criteria:
+      - ALIGN_DIFF / OPTIMAL_CMP only appear in zlib-ng code paths
+      - Other projects use explicit `(-(uintptr_t)src) & (align-1)` math instead
+
+  - id: 8
+    name: zlibng-tap-table-deferred-multiply
+    category: project-specific
+    description: >
+      zlib-ng's adler32 implementation uses a tap_table of position weights
+      loaded via vld1q_u16_x4_ex, with vmlal_u16 / vmlal_high_u16 applied
+      after the byte-accumulation loop. The deferred-multiply pattern is
+      general; the tap_table structure is zlib-ng specific.
+    metadata:
+      match_rules:
+        - pattern: "tap_table"
+          type: exact
+          scope: variable_reference
+          description: zlib-ng adler32 weight table
+    x64_constructs:
+      - "_mm_madd_epi16 with adler32 weight constants"
+    arm64_constructs:
+      - "uint16x8x4_t taps = vld1q_u16_x4_ex(tap_table, 256);"
+      - "acc   = vmlal_high_u16(acc,   taps.val[0], s2_0);"
+      - "acc_0 = vmlal_u16     (acc_0, vget_low_u16(taps.val[0]), vget_low_u16(s2_0));"
+    pitfalls:
+      - tap_table layout is zlib-ng specific — other projects need their own weight constants
+      - The principle (defer multiply) is reusable, the table layout is not
+    validation_criteria:
+      - tap_table appears only in zlib-ng adler32 code paths
+      - Deferred-multiply principle applied via vmlal after the byte-accumulation loop

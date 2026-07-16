@@ -1,0 +1,271 @@
+version: "1.0"
+generated_from: skills/intrinsics-x64-to-arm64/references/specs/intrinsic-mapping.md
+description: >
+  SSE/AVX to NEON intrinsic translation patterns. Covers load/store, broadcast,
+  compare, arithmetic, bitwise, shift, shuffle, horizontal reduction, type
+  conversion, conditional select, and prefetch.
+
+specs:
+  - id: 1
+    name: sse-load-store-to-neon
+    category: intrinsic-mapping
+    description: >
+      SSE/AVX load/store intrinsics map to NEON vld1q/vst1q. 256-bit AVX loads
+      must be split into two 128-bit NEON loads. Sub-128-bit loads use lane intrinsics.
+    metadata:
+      match_rules:
+        - pattern: "_mm_loadu_si128|_mm_load_si128|_mm_storeu_si128|_mm_store_si128"
+          type: regex
+          scope: intrinsic_call
+          description: SSE 128-bit integer load/store intrinsics
+        - pattern: "_mm256_loadu_si256|_mm256_storeu_si256"
+          type: regex
+          scope: intrinsic_call
+          description: AVX2 256-bit integer load/store intrinsics
+        - pattern: "_mm_loadu_ps|_mm_storeu_ps"
+          type: regex
+          scope: intrinsic_call
+          description: SSE float32 load/store intrinsics
+    x64_constructs:
+      - _mm_loadu_si128
+      - _mm256_loadu_si256
+      - _mm_storeu_ps
+    arm64_constructs:
+      - vld1q_u8(ptr)
+      - "vld1q_u8(ptr+0) + vld1q_u8(ptr+16) for 256-bit"
+      - vst1q_f32(ptr, v)
+    pitfalls:
+      - 256-bit loads MUST be split into two 128-bit operations
+      - Sub-128-bit (4-byte) loads must use vld1_lane_u32, not direct pointer cast
+    validation_criteria:
+      - No _mm_loadu_si128 or _mm256_loadu_si256 remain in ARM64 path
+      - 256-bit loads replaced with two vld1q calls
+
+  - id: 2
+    name: broadcast-splat-to-neon
+    category: intrinsic-mapping
+    description: >
+      SSE/AVX broadcast (set1) intrinsics map to NEON vdupq_n_* for 128-bit.
+      256-bit broadcasts use two duplicate registers.
+    metadata:
+      match_rules:
+        - pattern: "_mm_set1_epi(8|16|32|64)"
+          type: regex
+          scope: intrinsic_call
+          description: SSE broadcast integer intrinsics
+        - pattern: "_mm256_set1_epi(8|16|32)"
+          type: regex
+          scope: intrinsic_call
+          description: AVX2 broadcast integer intrinsics
+        - pattern: "_mm_setzero_si128|_mm256_setzero_si256"
+          type: regex
+          scope: intrinsic_call
+          description: Zero vector intrinsics
+    x64_constructs:
+      - _mm_set1_epi8(v)
+      - _mm256_set1_epi8(v)
+      - _mm_setzero_si128()
+    arm64_constructs:
+      - vdupq_n_u8(v)
+      - "vdupq_n_u8(v) x2 for 256-bit"
+      - vdupq_n_u8(0)
+    pitfalls:
+      - 256-bit set1 needs two separate vdupq calls (or reuse same register)
+    validation_criteria:
+      - All set1/setzero intrinsics replaced with vdupq_n_*
+
+  - id: 3
+    name: compare-to-neon
+    category: intrinsic-mapping
+    description: >
+      SSE compare intrinsics map to NEON vceqq/vcgtq/vcltq. Sign matters —
+      SSE _mm_cmpgt_epi8 is always signed, NEON has separate signed/unsigned variants.
+    metadata:
+      match_rules:
+        - pattern: "_mm_cmpeq_epi(8|16|32)"
+          type: regex
+          scope: intrinsic_call
+          description: SSE equality compare intrinsics
+        - pattern: "_mm_cmpgt_epi(8|16|32)"
+          type: regex
+          scope: intrinsic_call
+          description: SSE signed greater-than compare
+        - pattern: "_mm256_cmpeq_epi(8|16|32)"
+          type: regex
+          scope: intrinsic_call
+          description: AVX2 equality compare
+    x64_constructs:
+      - _mm_cmpeq_epi8(a, b)
+      - _mm_cmpgt_epi8(a, b)
+      - _mm256_cmpeq_epi8(a, b)
+    arm64_constructs:
+      - vceqq_u8(a, b)
+      - vcgtq_s8(a, b)
+      - "vceqq_u8(lo, lo) + vceqq_u8(hi, hi) for 256-bit"
+    pitfalls:
+      - SSE _mm_cmpgt_epi8 is SIGNED — must use vcgtq_s8 not vcgtq_u8
+      - Choose correct sign variant based on data interpretation
+    validation_criteria:
+      - Signed/unsigned NEON compare variant matches the data type semantics
+
+  - id: 4
+    name: bitwise-ops-to-neon
+    category: intrinsic-mapping
+    description: >
+      SSE bitwise intrinsics map to NEON vand/vorr/veor/vbic. Critical trap:
+      _mm_andnot_si128 has reversed operand order compared to NEON vbicq.
+    metadata:
+      match_rules:
+        - pattern: "_mm_and_si128|_mm_or_si128|_mm_xor_si128"
+          type: regex
+          scope: intrinsic_call
+          description: SSE bitwise AND/OR/XOR
+        - pattern: "_mm_andnot_si128"
+          type: exact
+          scope: intrinsic_call
+          description: SSE AND-NOT with reversed operand semantics
+        - pattern: "_mm256_and_si256|_mm256_or_si256|_mm256_xor_si256"
+          type: regex
+          scope: intrinsic_call
+          description: AVX2 bitwise operations
+    x64_constructs:
+      - "_mm_andnot_si128(a, b) // (~a) & b"
+      - _mm_and_si128(a, b)
+    arm64_constructs:
+      - "vbicq_u8(b, a) // b & (~a) — operands SWAPPED"
+      - vandq_u8(a, b)
+    pitfalls:
+      - "_mm_andnot_si128(a, b) = (~a) & b, but vbicq_u8(x, y) = x & (~y) — operands are REVERSED"
+      - This is the most common intrinsic porting bug
+    validation_criteria:
+      - All _mm_andnot_si128(a,b) replaced with vbicq_u8(b,a) (operands swapped)
+
+  - id: 5
+    name: shift-to-neon
+    category: intrinsic-mapping
+    description: >
+      SSE shift intrinsics map to NEON vshlq_n/vshrq_n for immediate shifts.
+      Variable shifts use vshlq with a count vector. Byte-shifts use vextq.
+    metadata:
+      match_rules:
+        - pattern: "_mm_slli_epi(16|32|64)"
+          type: regex
+          scope: intrinsic_call
+          description: SSE left shift by immediate
+        - pattern: "_mm_srli_epi(16|32|64)"
+          type: regex
+          scope: intrinsic_call
+          description: SSE logical right shift by immediate
+        - pattern: "_mm_srai_epi(16|32)"
+          type: regex
+          scope: intrinsic_call
+          description: SSE arithmetic right shift by immediate
+        - pattern: "_mm_srli_si128|_mm_slli_si128"
+          type: regex
+          scope: intrinsic_call
+          description: SSE byte-level shift (extract pattern)
+    x64_constructs:
+      - _mm_slli_epi32(a, n)
+      - _mm_srli_si128(a, n)
+    arm64_constructs:
+      - vshlq_n_u32(a, n)
+      - "vextq_u8(a, vdupq_n_u8(0), n)"
+    pitfalls:
+      - NEON vshlq with negative count does right shift (variable shift model)
+      - Byte-shift _mm_srli_si128 maps to vextq, not a simple shift
+    validation_criteria:
+      - Immediate shifts use vshlq_n/vshrq_n with correct type suffix
+      - Byte shifts use vextq pattern
+
+  - id: 6
+    name: shuffle-permute-to-neon
+    category: intrinsic-mapping
+    description: >
+      SSE shuffle/unpack intrinsics map to NEON vqtbl1q (byte shuffle), vzip1q/vzip2q
+      (unpack), and specialized reversal sequences.
+    metadata:
+      match_rules:
+        - pattern: "_mm_shuffle_epi8"
+          type: exact
+          scope: intrinsic_call
+          description: SSSE3 byte shuffle (table lookup)
+        - pattern: "_mm_unpacklo_epi(8|16|32|64)|_mm_unpackhi_epi(8|16|32|64)"
+          type: regex
+          scope: intrinsic_call
+          description: SSE interleave/unpack operations
+    x64_constructs:
+      - _mm_shuffle_epi8(a, mask)
+      - _mm_unpacklo_epi8(a, b)
+      - _mm_unpackhi_epi8(a, b)
+    arm64_constructs:
+      - vqtbl1q_u8(a, mask)
+      - vzip1q_u8(a, b)
+      - vzip2q_u8(a, b)
+    pitfalls:
+      - vqtbl1q_u8 returns 0 for out-of-range indices (SSE wraps with mask & 0x0F)
+      - Byte reversal needs multi-step sequence (vrev64q + vcombine swap)
+    validation_criteria:
+      - _mm_shuffle_epi8 replaced with vqtbl1q_u8
+      - Unpack operations use correct vzip1q/vzip2q variant
+
+  - id: 7
+    name: horizontal-reduction-to-neon
+    category: intrinsic-mapping
+    description: >
+      SSE horizontal operations map to NEON vmaxvq/vminvq/vaddvq for scalar reduction.
+      _mm_movemask_epi8 has no single-instruction equivalent — use vmaxvq for existence
+      test or vshrn for full bitmask.
+    metadata:
+      match_rules:
+        - pattern: "_mm_movemask_epi8"
+          type: exact
+          scope: intrinsic_call
+          description: Extract MSB of each byte into 16-bit mask
+        - pattern: "_mm_testz_si128"
+          type: exact
+          scope: intrinsic_call
+          description: Test if AND result is zero
+        - pattern: "_mm256_movemask_epi8"
+          type: exact
+          scope: intrinsic_call
+          description: AVX2 movemask (32-bit result)
+    x64_constructs:
+      - "_mm_movemask_epi8(v) != 0"
+      - _mm_testz_si128(a, b)
+    arm64_constructs:
+      - "vmaxvq_u8(v) != 0 (existence test)"
+      - "vshrn_n_u16 + vget_lane_u64 (full bitmask)"
+      - "vmaxvq_u8(vandq_u8(a,b)) == 0 (testz)"
+    pitfalls:
+      - Using vmaxvq for existence is fast but loses position info
+      - Full bitmask via vshrn produces nibble-based mask, divide position by 4
+    validation_criteria:
+      - _mm_movemask_epi8 replaced with appropriate NEON pattern based on usage
+      - Position-finding code accounts for nibble-based mask format
+
+  - id: 8
+    name: conditional-select-to-neon
+    category: intrinsic-mapping
+    description: >
+      SSE blendv maps to NEON vbslq. Critical operand order difference:
+      SSE blendv(a,b,mask) selects b where mask MSB=1; NEON vbslq(mask,b,a)
+      selects b where mask bit=1.
+    metadata:
+      match_rules:
+        - pattern: "_mm_blendv_epi8"
+          type: exact
+          scope: intrinsic_call
+          description: SSE byte-level conditional blend
+        - pattern: "_mm_blend_epi16"
+          type: exact
+          scope: intrinsic_call
+          description: SSE 16-bit blend with immediate mask
+    x64_constructs:
+      - "_mm_blendv_epi8(a, b, mask) // select b where mask MSB=1"
+    arm64_constructs:
+      - "vbslq_u8(mask, b, a) // select b where mask bit=1, a where 0"
+    pitfalls:
+      - Operand order is REVERSED between SSE and NEON
+      - SSE checks MSB of each byte; NEON checks all bits (but compare results are all-1s/all-0s so it matches)
+    validation_criteria:
+      - _mm_blendv_epi8(a,b,mask) replaced with vbslq_u8(mask,b,a) — verify operand swap

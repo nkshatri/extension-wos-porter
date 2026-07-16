@@ -1,0 +1,264 @@
+version: "1.0"
+generated_from: skills/asm-x64-to-arm64/references/specs/standalone-asm-dialect.md
+description: >
+  Dialect-level translation rules for porting standalone MASM x64 .asm files
+  to GAS arm64 .S syntax: section directives, procedure form, symbol visibility,
+  constants/macros, data-width annotation, includes, the 2-op-via-macro idiom,
+  and toolchain selection.
+
+specs:
+  - id: 1
+    name: file-section-directives
+    category: asm-directives
+    description: >
+      MASM .code/.data/.const map to GAS .text/.data/.section .rdata. Cache-
+      aligned SEGMENT becomes .section + explicit .balign.
+    metadata:
+      match_rules:
+        - pattern: "^\\s*\\.code\\b"
+          type: regex
+          scope: directive
+          description: MASM code section directive
+        - pattern: "^\\s*\\.const\\b"
+          type: regex
+          scope: directive
+          description: MASM read-only data section directive
+        - pattern: "^\\s*SEGMENT\\s+ALIGN"
+          type: regex
+          scope: directive
+          description: MASM custom-aligned SEGMENT
+    x64_constructs:
+      - .code
+      - .const
+      - "SEGMENT ALIGN(64)"
+    arm64_constructs:
+      - .text
+      - .section .rdata
+      - '.section .text.hotloop, "ax"' + .balign 64
+    pitfalls:
+      - .code and .text look interchangeable but the MASM version implies more (default alignment, calling conventions); always add explicit .balign if the original was aligned
+    validation_criteria:
+      - No .code / .const / SEGMENT directives remain in arm64 output
+      - Cache-aligned sections have explicit .balign N
+
+  - id: 2
+    name: procedure-definition
+    category: asm-directives
+    description: >
+      MASM PROC/ENDP becomes a label plus .global directive in GAS. ret must be
+      written explicitly — GAS never synthesizes one. OPTION PROLOGUE:NONE has
+      no equivalent (GAS emits no implicit prologue).
+    metadata:
+      match_rules:
+        - pattern: "\\b\\w+\\s+PROC\\b"
+          type: regex
+          scope: directive
+          description: MASM PROC definition
+        - pattern: "\\bENDP\\b"
+          type: regex
+          scope: directive
+          description: MASM ENDP closing
+        - pattern: "OPTION\\s+PROLOGUE"
+          type: regex
+          scope: directive
+          description: MASM OPTION PROLOGUE directive
+    x64_constructs:
+      - "MyFunc PROC ... ret ... MyFunc ENDP"
+    arm64_constructs:
+      - ".global MyFunc; MyFunc: ... ret"
+    pitfalls:
+      - Forgetting explicit ret — GAS does not synthesize one and the function falls through
+      - Forgetting .global makes the symbol file-private and breaks external links
+    validation_criteria:
+      - Every porter-visible function has a .global <name> line and a label
+      - Every function ends with an explicit ret
+
+  - id: 3
+    name: apple-symbol-prefix
+    category: asm-directives
+    description: >
+      Mach-O requires a leading underscore on globals; ELF and COFF use bare
+      names. Wrap every .globl/.global in #ifdef __APPLE__ to switch.
+    metadata:
+      match_rules:
+        - pattern: "^\\s*\\.global?\\b"
+          type: regex
+          scope: directive
+          description: GAS global symbol directive needing Apple/non-Apple split
+    x64_constructs:
+      - 'PUBLIC LzmaDec_DecodeReal_3   ; MASM bare-name export'
+    arm64_constructs:
+      - "#ifdef __APPLE__\\n  .globl _LzmaDec_DecodeReal_3\\n#else\\n  .global LzmaDec_DecodeReal_3\\n#endif"
+    pitfalls:
+      - Hard-coded _name breaks ELF/COFF links (linker looks for name)
+      - Hard-coded name breaks Apple builds (dyld cannot resolve missing-underscore form)
+    validation_criteria:
+      - Every .globl/.global directive is wrapped in #ifdef __APPLE__ switch with both forms
+
+  - id: 3b
+    name: elf-only-symbol-directives
+    category: asm-directives
+    description: >
+      .type name,@function / %function and .size are ELF-only and are rejected
+      by COFF (Windows ARM64 via clang) and Mach-O (Apple). Gate them on
+      #if defined(__ELF__), ideally inside the function/endfunc macro, so the
+      same .S assembles for every target object format. Other ELF-isms
+      (.section .note.GNU-stack, .hidden) need the same gating.
+    metadata:
+      match_rules:
+        - pattern: "^\\s*\\.(type|size)\\b"
+          type: regex
+          scope: directive
+          description: ELF-only symbol type/size directive needing __ELF__ gating
+        - pattern: "@function|%function"
+          type: regex
+          scope: directive
+          description: ELF function-type annotation, rejected on COFF/Mach-O
+    x64_constructs:
+      - ".type LzmaDec_DecodeReal_3,@function"
+      - ".size LzmaDec_DecodeReal_3, .-LzmaDec_DecodeReal_3"
+    arm64_constructs:
+      - "#if defined(__ELF__)\\n.macro endfunc name\\n  .size \\name, . - \\name\\n.endm\\n#else\\n.macro endfunc name\\n.endm\\n#endif"
+    pitfalls:
+      - A .S that assembles on Linux can still fail the Windows/Apple build solely due to an ungated .type/.size
+      - Do not wrap the directive in a CPP function-like macro taking the operands; the comma in '.size name, .-name' is parsed as a macro-arg separator. Define the whole function/endfunc macro twice, once per #if branch.
+    validation_criteria:
+      - .type/.size/@function and other ELF-isms appear only under #if defined(__ELF__) (directly or via a gated macro)
+      - The .S assembles for every target object format in scope (ELF + COFF, plus Mach-O if Apple is a target), not just the build host's
+
+  - id: 4
+    name: constant-and-macro-definitions
+    category: asm-directives
+    description: >
+      MASM `name equ value` becomes GAS `.equ name, value`; MASM
+      `macro foo:req`/`endm` becomes `.macro foo`/`.endm`. Macro body must
+      reference parameters as \\name in GAS, not bare name.
+    metadata:
+      match_rules:
+        - pattern: "^\\s*\\w+\\s+equ\\s+"
+          type: regex
+          scope: directive
+          description: MASM equ constant definition
+        - pattern: "^\\s*macro\\s+\\w+"
+          type: regex
+          scope: directive
+          description: MASM macro keyword definition
+        - pattern: "^\\s*endm\\b"
+          type: regex
+          scope: directive
+          description: MASM endm directive
+    x64_constructs:
+      - "MAX_LEN equ 273"
+      - "p2_add macro reg:req, param:req"
+    arm64_constructs:
+      - .equ MAX_LEN, 273
+      - ".macro p2_add reg:req, param:req"
+    pitfalls:
+      - GAS macro arguments are referenced as \\name, not bare name
+      - .macro does not support MASM vararg; multi-arity macros must be split into specific forms
+    validation_criteria:
+      - All `equ` definitions become `.equ`; all `macro`/`endm` become `.macro`/`.endm`
+      - Macro argument references inside the body use \\name
+
+  - id: 5
+    name: data-width-annotation
+    category: asm-instructions
+    description: >
+      MASM uses `dword ptr [rsi]` / `qword ptr [rsi]` / etc. for explicit
+      memory width. GAS arm64 encodes width in the mnemonic and register name
+      (ldr w0 vs ldr x0 vs ldrb w0 vs ldrh w0). Sign-extending loads use
+      ldrsb/ldrsh.
+    metadata:
+      match_rules:
+        - pattern: "\\b(byte|word|dword|qword|xmmword|ymmword)\\s+ptr\\b"
+          type: regex
+          scope: instruction
+          description: MASM ptr-keyword memory width annotation
+    x64_constructs:
+      - "mov rax, qword ptr [rsi]"
+      - "movzx eax, byte ptr [rsi]"
+      - "movsx eax, word ptr [rsi]"
+    arm64_constructs:
+      - ldr x0, [x1]
+      - ldrb w0, [x1]
+      - ldrsh w0, [x1]
+    pitfalls:
+      - Using ldrb/ldrh where x64 used movsx silently zero-extends instead of sign-extending
+    validation_criteria:
+      - No `ptr` keyword remains
+      - Signed-extension loads use ldrsb/ldrsh; unsigned use ldrb/ldrh
+
+  - id: 6
+    name: include-mechanism
+    category: asm-directives
+    description: >
+      MASM `include` becomes C-preprocessor `#include` — but only when the
+      source filename ends in .S (capital), not .s (lowercase, no preprocessing).
+    metadata:
+      match_rules:
+        - pattern: "^\\s*include\\s+\"?[\\w./]+\\.asm"
+          type: regex
+          scope: directive
+          description: MASM include directive
+    x64_constructs:
+      - 'include 7zAsm.asm'
+    arm64_constructs:
+      - '#include "7zAsm.S"'
+    pitfalls:
+      - Lowercase .s files are not preprocessed; #include / #ifdef / #define become assembler errors
+    validation_criteria:
+      - Source files needing preprocessing use .S extension
+      - All `include` directives become `#include`
+
+  - id: 7
+    name: two-operand-macro-shim
+    category: asm-style
+    description: >
+      x86 is two-operand; arm64 is three-operand. For long hot-loop ports
+      where diff-locality with the x86 source has review value, define a
+      p2_ macro layer that exposes 2-op form. Macros emit non-flag-setting
+      instructions; use _s suffix variants where flags are needed.
+    metadata:
+      match_rules:
+        - pattern: "\\.macro\\s+p[12]_\\w+"
+          type: regex
+          scope: directive
+          description: 2-op-via-macro shim definitions
+    x64_constructs:
+      - "add eax, ebx     ; 2-operand"
+    arm64_constructs:
+      - ".macro p2_add reg:req, param:req\\n        add \\reg, \\reg, \\param\\n.endm"
+      - ".macro p2_sub_s reg:req, param:req\\n        subs \\reg, \\reg, \\param\\n.endm"
+    pitfalls:
+      - Shim emits non-flag-setting forms; bodies needing flags must use _s variants — see flags-and-conditions
+      - Shim is documentation aid, not a portability layer — does not buy architecture neutrality
+    validation_criteria:
+      - Macros prefixed p2_ always have form `op \\reg, \\reg, \\param`
+      - Macros with _s suffix use flag-setting instructions (adds, subs, ands)
+
+  - id: 8
+    name: toolchain-selection-windows-arm64
+    category: build-system
+    description: >
+      Microsoft armasm64.exe does not consume GAS syntax. Default to clang
+      integrated assembler (clang -c --target=aarch64-pc-windows-msvc) so the
+      same .S works on Linux, macOS, and Windows-on-ARM64.
+    metadata:
+      match_rules:
+        - pattern: "armasm64\\.exe"
+          type: regex
+          scope: directive
+          description: Build invocation of Microsoft armasm64
+        - pattern: "ml64\\.exe"
+          type: regex
+          scope: directive
+          description: Build invocation of Microsoft ml64 (x64 MASM)
+    x64_constructs:
+      - "ml64.exe /c file.asm"
+    arm64_constructs:
+      - "clang -c --target=aarch64-pc-windows-msvc file.S -o file.obj"
+    pitfalls:
+      - Feeding GAS .S to armasm64.exe produces unreadable error cascades — dialect mismatch is total
+    validation_criteria:
+      - Build invocation uses clang -c --target=aarch64-pc-windows-msvc for .S files on Windows ARM64
+      - No armasm64.exe invocation against a GAS-syntax source

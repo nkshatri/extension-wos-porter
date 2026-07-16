@@ -1,0 +1,551 @@
+version: "1.0"
+generated_from: skills/sse-avx-to-neon/references/specs/avx512-decomposition.md
+description: >
+  Decomposition patterns for porting AVX-512 (512-bit) intrinsics to ARM NEON's
+  128-bit registers. Each AVX-512 op decomposes into four independent 128-bit
+  NEON ops; mask types and the AVX-512-only horizontal-reduction / SAD /
+  maddubs / VNNI / clmul / permute families need NEON-specific recipes that
+  have no SSE/AVX2 analogue.
+
+specs:
+
+  - id: 1
+    name: load-split-512bit
+    category: register-width
+    description: >
+      ARM NEON has no 512-bit register; the maximum native width is 128-bit.
+      Replace each _mm512_loadu_si512 / _mm512_load_si512 / _mm512_loadu_ps /
+      _mm512_loadu_pd with four 128-bit vld1q_* loads at offsets that match
+      the element size (offset 0/4/8/12 for 32-bit, 0/16/32/48 bytes when
+      indexing through a uint8_t* pointer). Also covers __m512[id]? type
+      declarations — those become four independent NEON variables (or one
+      uint8x16x4_t struct).
+    metadata:
+      match_rules:
+        - pattern: "_mm512_(load|loadu)_(si512|ps|pd)"
+          type: regex
+          scope: intrinsic_call
+          description: Any 512-bit AVX-512 load intrinsic
+        - pattern: "\\b__m512[id]?\\b"
+          type: regex
+          scope: declaration
+          description: 512-bit AVX-512 register type declarations
+    x64_constructs:
+      - _mm512_loadu_si512
+      - _mm512_load_si512
+      - _mm512_loadu_ps
+      - _mm512_loadu_pd
+      - "__m512i / __m512 / __m512d typed locals"
+    arm64_constructs:
+      - "vld1q_u8(ptr + 0/16/32/48) for raw byte loads"
+      - "vld1q_s32(ptr + 0/4/8/12) for 32-bit element loads"
+      - "vld1q_f32(ptr + 0/4/8/12) for float loads"
+      - "uint8x16x4_t blk = vld1q_u8_x4(ptr) — one struct load covering 64 bytes (preferred for memory-bound loops)"
+      - "Replace each __m512i local with four uint8x16_t / uint16x8_t / uint32x4_t variables, or one uint8x16x4_t"
+    pitfalls:
+      - "Element offsets multiply by element count, not byte count: 4 lanes per 128-bit at 32-bit width, 8 at 16-bit, 16 at 8-bit"
+      - "Mixing element widths in the four NEON locals breaks unification — keep all four halves the same NEON type"
+      - "Do not load only the first 128 bits — the remaining 384 bits of the AVX-512 vector would be silently dropped"
+      - "uint8x16x4_t struct loads compile to four LDR/LDP instructions on AArch64 — use it when bandwidth matters; fall back to four explicit vld1q calls when registers must alias for in-place updates"
+    validation_criteria:
+      - Each AVX-512 512-bit load is replaced by four adjacent vld1q calls (or one vld1q_*_x4 struct load)
+      - No __m512i / __m512 / __m512d types remain in the ARM64 code path
+      - Pointer offsets are scaled by element count, not byte count
+
+  - id: 2
+    name: store-split-512bit
+    category: register-width
+    description: >
+      Symmetric to load-split-512bit. Replace each _mm512_storeu_si512 /
+      _mm512_store_si512 / _mm512_storeu_ps / _mm512_storeu_pd with four
+      adjacent vst1q_* stores or one vst1q_*_x4 struct store.
+    metadata:
+      match_rules:
+        - pattern: "_mm512_(store|storeu)_(si512|ps|pd)"
+          type: regex
+          scope: intrinsic_call
+          description: AVX-512 512-bit store intrinsics
+    x64_constructs:
+      - _mm512_storeu_si512
+      - _mm512_store_si512
+      - _mm512_storeu_ps
+      - _mm512_storeu_pd
+    arm64_constructs:
+      - "vst1q_u8(dst + 0/16/32/48, v0..v3)"
+      - "vst1q_s32(dst + 0/4/8/12, v0..v3)"
+      - "vst1q_u8_x4(dst, blk) — one struct store covering 64 bytes (preferred for memory-bound loops)"
+    pitfalls:
+      - Index offsets must match element width — a single 16-byte stride over an int32* pointer would scale to 4 elements, not 16
+      - "_mm512_store_si512 (aligned) does not require alignment on NEON — vst1q_u8 has no alignment constraint, so the distinction between store and storeu collapses"
+      - Do not interleave the four stores arbitrarily — stay in lo→hi order to preserve the original memory layout
+    validation_criteria:
+      - Each AVX-512 512-bit store is replaced by four adjacent vst1q calls (or one vst1q_*_x4 struct store)
+      - Memory order matches the AVX-512 lane-0 → lane-3 layout
+
+  - id: 3
+    name: basic-elementwise-512
+    category: register-width
+    description: >
+      For any element-wise AVX-512 operation (add, sub, mul, div, and/or/xor,
+      min/max, compare, shift, abs, neg), apply the matching 128-bit NEON
+      intrinsic to each of the four halves independently. Operands must be
+      paired half-by-half (a0/b0, a1/b1, a2/b2, a3/b3); never collapse the
+      four halves into fewer wider ops.
+    metadata:
+      match_rules:
+        - pattern: "_mm512_(add|sub|mul|div|and|or|xor|andnot|min|max|cmp|sll|srl|sra|sllv|srlv|srav|abs|sign)_"
+          type: regex
+          scope: intrinsic_call
+          description: Element-wise AVX-512 512-bit arithmetic / logical / compare / shift intrinsics
+    x64_constructs:
+      - _mm512_add_epi32
+      - _mm512_add_ps
+      - _mm512_add_pd
+      - _mm512_sub_epi16
+      - _mm512_mul_ps
+      - _mm512_and_si512
+      - _mm512_or_si512
+      - _mm512_xor_si512
+      - _mm512_andnot_si512
+      - _mm512_slli_epi32
+      - _mm512_min_epu8
+      - _mm512_max_epi32
+      - _mm512_abs_epi32
+    arm64_constructs:
+      - "vaddq_s32 / vsubq_s32 / vmulq_s32 applied to each of v0..v3"
+      - "vaddq_f32 / vmulq_f32 for ps; vaddq_f64 for pd (AArch64 only)"
+      - "vandq_u8 / vorrq_u8 / veorq_u8 / vbicq_u8 (vbicq is the NEON andnot)"
+      - "vshlq_n_s32 / vshrq_n_s32 for immediate shifts; vshlq_s32 with negative count for variable right shift"
+      - "vminq_u8 / vmaxq_s32 / vabsq_s32"
+    pitfalls:
+      - "Always four NEON ops per AVX-512 op — do not try to fold two 128-bit halves into one 256-bit-equivalent (NEON has no 256-bit type)"
+      - "vaddq_f64 and other float64 ops require AArch64 — guard with defined(__aarch64__)"
+      - "_mm512_andnot_si512(a, b) computes (~a) & b; the NEON equivalent is vbicq_u8(b, a) — note the operand swap"
+      - The four halves must use independent operands; never alias a single half across the unrolled body
+    validation_criteria:
+      - Each AVX-512 element-wise op produces exactly four 128-bit NEON ops
+      - Result is held in r0..r3 (four NEON variables, same element type)
+
+  - id: 4
+    name: set-zero-cast-broadcast-512
+    category: constants-and-casts
+    description: >
+      Constructors / zero-initialisers / cross-width casts in AVX-512 collapse
+      to NEON broadcast or copy patterns: _mm512_setzero_si512 → four
+      vdupq_n_*(0); _mm512_set1_epi* → four vdupq_n_*; _mm512_set_epi* /
+      setr_epi* / set4_epi32 → vld1q from a small const array; _mm512_zextsi128_si512
+      and _mm512_castsi128_si512 → place the 128-bit input in v0 and zero v1..v3
+      (zext) or leave v1..v3 undefined (cast). _mm512_castsi512_si256 takes
+      the low two halves verbatim.
+    metadata:
+      match_rules:
+        - pattern: "_mm512_setzero_(si512|ps|pd)"
+          type: regex
+          scope: intrinsic_call
+          description: AVX-512 zero constructors
+        - pattern: "_mm512_set1_epi(8|16|32|64)"
+          type: regex
+          scope: intrinsic_call
+          description: AVX-512 broadcast/splat constructors
+        - pattern: "_mm512_set_(epi8|epi16|epi32|epi64|ps|pd)"
+          type: regex
+          scope: intrinsic_call
+          description: AVX-512 explicit-element constructors
+        - pattern: "_mm512_setr_(epi8|epi16|epi32|epi64|ps|pd)"
+          type: regex
+          scope: intrinsic_call
+          description: AVX-512 reversed-order element constructors
+        - pattern: "_mm512_set4_(epi32|epi64|ps|pd)"
+          type: regex
+          scope: intrinsic_call
+          description: AVX-512 set-4-broadcast (replicates 4 elements across 4 lanes)
+        - pattern: "_mm512_(zextsi|castsi)128_si512"
+          type: regex
+          scope: intrinsic_call
+          description: AVX-512 lift-from-128 casts (zextsi zeros upper, castsi leaves undefined)
+        - pattern: "_mm512_castsi512_(si256|si128|ps|pd)"
+          type: regex
+          scope: intrinsic_call
+          description: AVX-512 truncate-to-narrower casts
+    x64_constructs:
+      - _mm512_setzero_si512
+      - _mm512_set1_epi16
+      - _mm512_set1_epi32
+      - _mm512_set_epi8
+      - _mm512_setr_epi32
+      - _mm512_set4_epi32
+      - _mm512_zextsi128_si512
+      - _mm512_castsi128_si512
+      - _mm512_castsi512_si256
+    arm64_constructs:
+      - "v0 = v1 = v2 = v3 = vdupq_n_u8(0)  for setzero"
+      - "v0 = v1 = v2 = v3 = vdupq_n_u32(x)  for set1"
+      - "static const T tbl[64] = { ... }; v0 = vld1q_*(tbl); v1 = vld1q_*(tbl+lanes); ..."
+      - "zext: v0 = src128; v1 = v2 = v3 = vdupq_n_*(0);"
+      - "cast (no zero-extend): v0 = src128; v1..v3 left as initial garbage — must not be read"
+      - "cast-down si256: result is the pair (v0, v1) of the low half"
+    pitfalls:
+      - "_mm512_setr_* takes elements in reversed order vs _mm512_set_* — the const array layout must match"
+      - "_mm512_castsi128_si512 leaves the upper 384 bits undefined; if the code later reads them, the cast is incorrect — use zextsi128 instead and zero-fill v1..v3"
+      - "_mm512_set4_epi32 broadcasts 4 elements across all 4 lanes — same as a single 128-bit vld1q broadcast to v0..v3"
+      - Never rely on x86 lane order in AArch64 — verify the const-array layout against the documented AVX-512 imm8 ordering
+    validation_criteria:
+      - All four NEON variables (v0..v3) are explicitly initialised
+      - setzero / set1 / cast paths produce the correct upper-half disposition (zero vs undefined-but-unread)
+      - set_/setr_ const-array layout matches the documented AVX-512 lane order
+
+  - id: 5
+    name: extract-insert-512
+    category: cross-lane
+    description: >
+      _mm512_extracti{32x4,64x2,32x8,64x4}_epi* selects one or two 128-bit
+      halves; _mm512_inserti{32x4,64x2,...} replaces one half. Since the four
+      halves are already separate variables in NEON, extract/insert become
+      compile-time variable selection (no runtime branch). The imm8 lane
+      index becomes a #if / switch on a compile-time constant.
+    metadata:
+      match_rules:
+        - pattern: "_mm512_(extract|insert)i(32x4|64x2|32x8|64x4)"
+          type: regex
+          scope: intrinsic_call
+          description: AVX-512 lane extract/insert (integer)
+        - pattern: "_mm512_(extract|insert)f(32x4|64x2|32x8|64x4)"
+          type: regex
+          scope: intrinsic_call
+          description: AVX-512 lane extract/insert (float)
+    x64_constructs:
+      - _mm512_extracti32x4_epi32
+      - _mm512_extracti64x2_epi64
+      - _mm512_extracti64x4_epi64
+      - _mm512_inserti32x4
+      - _mm512_inserti64x2
+      - _mm512_extractf32x4_ps
+    arm64_constructs:
+      - "extract32x4 lane K: result = vK  (K = 0..3 from imm8 & 0x3)"
+      - "extract64x4 lane K: result = pair (v_{2K}, v_{2K+1})  (K = 0..1)"
+      - "extract64x2 lane K: subset of one 128-bit half — vextq_u64(vK, vK, idx) when not lane-aligned"
+      - "inserti32x4 lane K: r0..r3 = v0..v3 with rK = b128"
+      - "inserti64x4 lane K: replace pair (r_{2K}, r_{2K+1}) with (b256_lo, b256_hi)"
+    pitfalls:
+      - imm8 lane index is always a compile-time constant — emit a switch / template, never a runtime branch
+      - "extracti64x4 returns a 256-bit pair, not a single NEON 128-bit value — the caller must accept two NEON variables"
+      - "Bit width in the suffix (32x4 vs 64x2 vs 32x8) selects how many 128-bit halves are touched per call — read it carefully"
+    validation_criteria:
+      - Extract becomes a direct copy / variable rename, not a function call
+      - Insert produces r0..r3 with one half from the new value and the others unchanged
+      - No runtime conditional on imm8 in the generated NEON code
+
+  - id: 6
+    name: mask-types-512
+    category: predication
+    description: >
+      AVX-512 introduces __mmask8 / __mmask16 / __mmask32 / __mmask64 — opaque
+      bitmask types. Replace these with plain integer types (uint8_t / uint16_t
+      / uint32_t / uint64_t) on NEON. _mm512_kand / kor / knot / kshiftli /
+      kshiftri become &, |, ~, <<, >>. Mask propagation through the algorithm
+      stays in scalar registers; only the producers (cmp-mask-to-bitmask, id 8)
+      and consumers (masked-load-store, id 7) need NEON-specific recipes.
+    metadata:
+      match_rules:
+        - pattern: "\\b__mmask(8|16|32|64)\\b"
+          type: regex
+          scope: declaration
+          description: AVX-512 mask type declarations
+        - pattern: "_(mm512_)?k(and|andn|or|xor|xnor|not|shiftli|shiftri|test|add|mov)_mask(8|16|32|64)"
+          type: regex
+          scope: intrinsic_call
+          description: AVX-512 mask register intrinsics
+    x64_constructs:
+      - "__mmask8 / __mmask16 / __mmask32 / __mmask64 typed locals"
+      - _kand_mask16
+      - _kor_mask32
+      - _knot_mask64
+      - _kshiftli_mask16
+    arm64_constructs:
+      - "uint8_t / uint16_t / uint32_t / uint64_t replace __mmaskN"
+      - "& | ~ << >> replace _kand / _kor / _knot / _kshiftli / _kshiftri"
+      - "Use __builtin_popcountll / vcntq_u8(...)+vaddvq_u8 to count set lanes when needed"
+      - "Use __builtin_ctzll / __builtin_clzll on MSVC ARM64 via _BitScanForward64 / _BitScanReverse64 (see project shim)"
+    pitfalls:
+      - "MSVC ARM64 lacks __builtin_ctzll — wrap _BitScanForward64 in an inline shim"
+      - "Mask width must match the data width: a 64-byte SIMD lane needs __mmask64 → uint64_t, not uint32_t"
+      - "Do not store masks in floating-point or NEON registers — they should stay in general-purpose registers"
+      - "Sign-vs-unsigned matters: shifts on signed types are implementation-defined for negative values"
+    validation_criteria:
+      - All __mmaskN types replaced with the matching uintNN_t
+      - All k* intrinsics replaced with plain C bitwise operators
+      - MSVC compatibility shim is in place for any __builtin_ctzll / __builtin_clzll usage
+
+  - id: 7
+    name: masked-load-store-512
+    category: predication
+    description: >
+      AVX-512 _mm512_maskz_loadu_epi8/16 / _mm512_mask_loadu_epi8/16 /
+      _mm512_mask_storeu_epi8/16 (and ps/pd variants) have no native NEON
+      equivalent. Replace with one of: (a) full 128-bit vld1q + vandq with a
+      lane-mask vector (zero-mask form), (b) byte-by-byte scalar loop for the
+      tail when len < 16, (c) vbslq_u8(mask_vec, full_load, dst) for masked
+      stores, (d) overlapping 16-byte loads with offset adjustment when len
+      ≥ 16. Choice depends on len and alignment; benchmark the SIMD-with-mask
+      vs scalar-tail tradeoff once per kernel.
+    metadata:
+      match_rules:
+        - pattern: "_mm512_(maskz|mask)_(load|loadu|store|storeu)_(epi8|epi16|epi32|epi64|ps|pd)"
+          type: regex
+          scope: intrinsic_call
+          description: AVX-512 mask/maskz load and store intrinsics
+        - pattern: "_mm_(maskz|mask)_(load|loadu|store|storeu)_epi(8|16)"
+          type: regex
+          scope: intrinsic_call
+          description: AVX-512 VL 128-bit masked load/store (also no NEON equivalent)
+    x64_constructs:
+      - _mm512_maskz_loadu_epi8
+      - _mm512_mask_storeu_epi8
+      - _mm512_mask_loadu_epi32
+      - _mm_maskz_loadu_epi8
+    arm64_constructs:
+      - "Build mask vector: uint8x16_t mask = vcltq_u8(vcombine_u8(idx_lo, idx_hi), vdupq_n_u8(len))"
+      - "Zero-mask load: data = vandq_u8(vld1q_u8(ptr), mask)  for each of the four halves"
+      - "Mask store: vst1q_u8(dst, vbslq_u8(mask, src, vld1q_u8(dst)))"
+      - "Scalar tail loop: for (size_t i = 0; i < tail; i++) dst[i] = src[i]; — preferred when tail < 16"
+      - "Overlapping load: when len ≥ 16 read the last 16 bytes from (ptr + len - 16) and shift to align"
+    pitfalls:
+      - "Reading bytes past the buffer end with a full vld1q can crash if the buffer ends near a page boundary — use a scalar tail loop or guarded overlapping load"
+      - "vbslq_u8 with a non-{0x00,0xFF} mask produces garbage — masks must be all-ones or all-zeros per byte; convert __mmask64 to a vector mask via lane-by-lane comparison or a precomputed table"
+      - "Do not assume the AVX-512 mask is bit-packed in the same order as a NEON byte mask — bit i of the __mmaskN corresponds to lane i of the NEON vector, but be careful with cross-half splits"
+      - "The masked store path adds a load-modify-store dependency (read dst, blend, write dst) that can dominate runtime for tiny tails — prefer the scalar fallback when len is small"
+    validation_criteria:
+      - No _mm512_(mask|maskz)_(load|store)* calls remain in the ARM64 path
+      - Scalar tail loop or vector-mask-with-blend covers every byte the AVX-512 mask covered
+      - Buffer overrun on the trailing partial vector is impossible (guarded by len check or overlapping load)
+
+  - id: 8
+    name: cmp-mask-to-bitmask-512
+    category: predication
+    description: >
+      _mm512_cmpeq_epu8_mask / _mm512_cmpgt_epi32_mask / _mm512_cmpneq_*_mask
+      produce a __mmaskN bitmask directly. NEON comparisons (vceqq_*, vcgtq_*)
+      produce a per-lane vector of 0xFF / 0x00. Convert to a bitmask via a
+      pmovmskb-equivalent recipe. For one 16-byte half the recipe is:
+      vshrn_n_u16(vreinterpretq_u16_u8(cmp), 4) → vget_lane_u64 → ~mask;
+      ctz(~mask) / 4 gives the byte offset. For 64-byte width OR the four
+      half-results into a single __mmask64 via shift+or.
+    metadata:
+      match_rules:
+        - pattern: "_mm512_cmp(eq|gt|lt|ge|le|neq)_(epu?8|epu?16|epi32|epi64|ps|pd)_mask"
+          type: regex
+          scope: intrinsic_call
+          description: AVX-512 compare-to-bitmask intrinsics
+        - pattern: "_mm512_cmp_(epu?8|epu?16|epi32|epi64|ps|pd)_mask"
+          type: regex
+          scope: intrinsic_call
+          description: AVX-512 generic compare-to-bitmask intrinsics (with imm8 predicate)
+        - pattern: "_mm_cmp(eq|gt|lt|ge|le|neq)_(epu?8|epu?16|epi32|epi64)_mask"
+          type: regex
+          scope: intrinsic_call
+          description: AVX-512 VL 128-bit compare-to-bitmask (also no direct NEON form)
+    x64_constructs:
+      - _mm512_cmpeq_epu8_mask
+      - _mm512_cmpgt_epi32_mask
+      - _mm512_cmp_epi8_mask
+      - _mm_cmpeq_epu8_mask
+    arm64_constructs:
+      - "uint8x16_t cmp = vceqq_u8(a, b);   // 0xFF on match, 0x00 on mismatch"
+      - "uint64_t lane_mask = vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(cmp), 4)), 0);   // pack 16 bytes → 64 bits, 4 bits per lane"
+      - "uint64_t bitmask = lane_mask;   // each set nibble = matching byte"
+      - "uint32_t mismatch_off = __builtin_ctzll(~lane_mask) >> 2;   // first non-matching byte"
+      - "For 64-byte width: shift the four 16-bit per-half results into bits [0..15], [16..31], [32..47], [48..63] of a single uint64_t"
+    pitfalls:
+      - "vshrn_n_u16(_, 4) packs 16 bytes into 64 bits with 4 bits per byte (nibble per lane); divide ctz by 4 (>> 2) to get byte offset, not by 1"
+      - "An alternative recipe uses vandq with a per-lane bit table + vaddv — slower than vshrn but explicit; do not mix recipes within one routine"
+      - "Endianness: vget_lane_u64 reads in NEON lane order; on a big-endian aarch64 the bit layout of the bitmask is reversed — guard with __ARM_BIG_ENDIAN if portability matters"
+      - "When the AVX-512 code does a 64-byte-wide cmpeq, make sure the four NEON halves contribute bits in the correct order to reproduce the __mmask64 layout"
+    validation_criteria:
+      - No _mm512_*cmp*_mask or _mm_*cmp*_mask intrinsic remains in the ARM64 path
+      - The bitmask returned by the NEON recipe matches the AVX-512 result bit-for-bit (verified by a unit test or by algorithmic equivalence)
+      - Counting / scanning the bitmask uses portable __builtin_ctzll / clzll wrappers (with MSVC shim)
+
+  - id: 9
+    name: reduce-512-to-scalar
+    category: horizontal-reduction
+    description: >
+      _mm512_reduce_(add|min|max|and|or|xor)_(epi32|epi64|epu32|ps|pd) is a
+      512-bit horizontal reduction. NEON has the per-128-bit reductions
+      vaddvq / vmaxvq / vminvq / etc. Combine the four halves with the
+      matching pairwise vXXXq op (vaddq for add, vmaxq for max, …) into a
+      single 128-bit accumulator, then call vaddvq_* / vmaxvq_* / vminvq_*
+      on it. For ps/pd float reductions, vaddvq_f32 / vmaxvq_f32 etc. are
+      AArch64 only.
+    metadata:
+      match_rules:
+        - pattern: "_mm512_reduce_(add|min|max|and|or|xor|mul)_(epi32|epi64|epu32|epu64|ps|pd)"
+          type: regex
+          scope: intrinsic_call
+          description: AVX-512 512-bit horizontal-reduction intrinsics
+    x64_constructs:
+      - _mm512_reduce_add_epi32
+      - _mm512_reduce_add_epu32
+      - _mm512_reduce_max_epi32
+      - _mm512_reduce_min_ps
+      - _mm512_reduce_or_epi64
+    arm64_constructs:
+      - "uint32x4_t s = vaddq_u32(vaddq_u32(v0, v1), vaddq_u32(v2, v3));   // tree reduce"
+      - "uint32_t total = vaddvq_u32(s);   // final horizontal add"
+      - "Replace vaddq_/vaddvq_ with vmaxq_/vmaxvq_, vminq_/vminvq_, vandq_/vandvq_*, vorrq_/, veorq_/ for the corresponding reduce variant"
+      - "Float reductions: vaddvq_f32 (AArch64 only); on ARMv7 fall back to vpadd_f32 chain"
+    pitfalls:
+      - "_mm512_reduce_mul_* has no NEON intrinsic equivalent — emit a scalar loop after a vector multiply tree, or restructure the algorithm to avoid horizontal multiply"
+      - "Saturating vs wrapping arithmetic in the tree — _mm512_reduce_add wraps; if the algorithm needs saturation use vqaddq_* in the tree but be aware of element-width promotion"
+      - "Mixing element sizes across the four halves before the reduction is a bug — all four halves must be the same NEON type when the tree starts"
+      - "vaddvq returns a scalar; do not feed it back into a NEON op without re-broadcasting"
+    validation_criteria:
+      - No _mm512_reduce_* intrinsic remains in the ARM64 path
+      - The four halves are combined with one tree (3 vXXXq ops) then one vXXXvq scalarisation
+      - Element type is consistent across the four halves and the scalar destination matches the AVX-512 return type
+
+  - id: 10
+    name: sad-maddubs-madd-vnni-512
+    category: arithmetic-recipes
+    description: >
+      _mm512_sad_epu8 (sum of absolute differences against zero), _mm512_maddubs_epi16
+      (unsigned×signed byte multiply-add to 16-bit), _mm512_madd_epi16 (signed
+      16×16 multiply-add to 32-bit), and _mm512_dpbusd_epi32 (AVX-512-VNNI:
+      u8×s8 dot product into i32) have no 1:1 NEON equivalent. Use widening
+      pairwise-add and widening multiply recipes: vpaddlq_u8 / vpadalq_u8 for
+      SAD, vmull_u8 / vmlal_u8 + vpaddlq_u16 for maddubs, vmull_s16 +
+      vpaddlq_s32 for madd, and udot/sdot (ARMv8.2-A DotProd) or vmlal+vpaddl
+      chains for VNNI.
+    metadata:
+      match_rules:
+        - pattern: "_mm512_sad_(epu8|epi8)"
+          type: regex
+          scope: intrinsic_call
+          description: AVX-512 sum-of-absolute-differences
+        - pattern: "_mm512_maddubs_epi16"
+          type: regex
+          scope: intrinsic_call
+          description: AVX-512 unsigned×signed byte multiply-add
+        - pattern: "_mm512_madd_epi16"
+          type: regex
+          scope: intrinsic_call
+          description: AVX-512 signed 16×16 multiply-add to 32-bit
+        - pattern: "_mm512_(dpbusd|dpbusds|dpwssd|dpwssds)_(epi32)"
+          type: regex
+          scope: intrinsic_call
+          description: AVX-512-VNNI dot-product accumulators
+    x64_constructs:
+      - _mm512_sad_epu8
+      - _mm512_maddubs_epi16
+      - _mm512_madd_epi16
+      - _mm512_dpbusd_epi32
+    arm64_constructs:
+      - "SAD: uint16x8_t s = vpaddlq_u8(v0); s = vpadalq_u8(s, v1); s = vpadalq_u8(s, v2); s = vpadalq_u8(s, v3); — four halves merged into one u16x8 (no overflow up to 64*255 = 16320)"
+      - "Final SAD scalar: uint32_t sad = vaddlvq_u16(s);"
+      - "maddubs (per half): uint16x8_t lo = vmull_u8(vget_low_u8(a), vget_low_u8(b)); uint16x8_t hi = vmull_u8(vget_high_u8(a), vget_high_u8(b));"
+      - "Reduce maddubs lanes: uint32x4_t r = vpaddlq_u16(vaddq_u16(lo, hi));"
+      - "madd_epi16: int32x4_t lo = vmull_s16(vget_low_s16(a), vget_low_s16(b)); int32x4_t hi = vmull_high_s16(a, b);  — already 32-bit per lane"
+      - "VNNI dpbusd: int32x4_t r = vdotq_s32(acc, sb_vec, ub_vec);   // ARMv8.2-A DotProd"
+      - "VNNI fallback (no DotProd): int16x8_t prod_lo = vmulq_s16(vmovl_s8(vget_low_s8(s)), vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(u)))); ... reduce to i32 via vpaddlq_s16"
+    pitfalls:
+      - "The four 128-bit halves contribute different position weights in some Adler-32-style algorithms — keep separate weight vectors per half (length-16 byte tables, four of them) rather than one length-64 table"
+      - "vmull_u8 outputs uint16x8_t — overflow becomes possible above 255 × 65535 / 8 ≈ 2 MiB of accumulation; insert a periodic reduction to uint32x4_t"
+      - "vdotq_s32 / vdotq_u32 require ARMv8.2-A DotProd (HWCAP_ASIMDDP); guard with __ARM_FEATURE_DOTPROD and runtime feature detection if you must support older cores"
+      - "vmull_high_s16 on AArch64 and vmull_s16 on the high half (vget_high_s16 + vmull_s16) emit different code on some compilers — pick one and stay consistent"
+      - "_mm512_dpbusd_epi32 is unsigned×signed; vdotq_s32 takes signed×signed and vdotq_u32 takes unsigned×unsigned — neither matches exactly; check the sign of each operand and adjust via vmovl_s8 / vmovl_u8"
+    validation_criteria:
+      - No _mm512_(sad|maddubs|madd|dpbusd|dpwssd)_* intrinsic remains in the ARM64 path
+      - Accumulator widening matches the AVX-512 element promotion (epu8→epi32 for sad, epu8/epi8→epi16 for maddubs, etc.)
+      - Periodic reduction prevents 16-bit accumulator overflow in long loops
+      - VNNI fallback present and behind the same feature guard as the DotProd fast path
+
+  - id: 11
+    name: clmul-512
+    category: crypto-and-clmul
+    description: >
+      _mm512_clmulepi64_epi128 performs four parallel 64×64 → 128 carry-less
+      multiplies, one per 128-bit lane. NEON's vmull_p64 / vmull_high_p64
+      (from ARMv8 Crypto Extensions, __ARM_FEATURE_PMULL) does one 64×64
+      multiply at a time, so each AVX-512 clmul becomes four NEON pmull
+      calls — one per half. The four imm8 lane-select variants
+      (0x00/0x01/0x10/0x11) map to vmull_p64(vgetq_lane_u64(a, k),
+      vgetq_lane_u64(b, k')) or vmull_high_p64 when both selectors are 1.
+    metadata:
+      match_rules:
+        - pattern: "_mm512_clmulepi64_epi128"
+          type: regex
+          scope: intrinsic_call
+          description: AVX-512 four-lane 64×64 carry-less multiply
+        - pattern: "\\bvpclmulqdq\\b"
+          type: regex
+          scope: instruction
+          description: VPCLMULQDQ assembly mnemonic for the same operation
+    x64_constructs:
+      - _mm512_clmulepi64_epi128
+      - VPCLMULQDQ
+    arm64_constructs:
+      - "Per half: poly128_t r0 = vmull_p64(vgetq_lane_u64(vreinterpretq_u64_u8(a_half), 0), vgetq_lane_u64(vreinterpretq_u64_u8(b_half), 0));   // imm8=0x00"
+      - "Define clmul_lo_lo / clmul_hi_lo / clmul_lo_hi / clmul_hi_hi macros (see crc32-pmull.md) — apply them per half"
+      - "Wrap in __ARM_FEATURE_PMULL guard; provide a software fallback for cores without crypto extensions"
+    pitfalls:
+      - "Each AVX-512 clmul produces four 128-bit results — emit four vmull_p64 calls, not one"
+      - "vmull_p64 is part of the ARMv8 Crypto Extensions, which are optional on baseline ARMv8 — runtime detection via getauxval(AT_HWCAP) + HWCAP_PMULL is required for distribution binaries"
+      - "vmull_high_p64 takes both operands as poly64x2_t and uses their high lanes — do not pair it with vgetq_lane_u64 on the low lane"
+      - "Reinterpret chains (u8 → u64 → p64 → u128 → u8) get verbose; define helper macros per crc32-pmull.md and use them everywhere — never inline the reinterpret chain"
+    validation_criteria:
+      - No _mm512_clmulepi64_epi128 calls remain in the ARM64 path
+      - Each AVX-512 clmul has been replaced with exactly four vmull_p64 / vmull_high_p64 calls
+      - clmul_lo_lo / hi_lo / lo_hi / hi_hi macros are used consistently — no inline reinterpret chains
+      - __ARM_FEATURE_PMULL guard plus runtime fallback are in place
+
+  - id: 12
+    name: permute-shuffle-ternary-512
+    category: cross-lane
+    description: >
+      _mm512_permutexvar_epi8/16/32/64, _mm512_shuffle_epi8, _mm512_alignr_epi8,
+      and _mm512_ternarylogic_epi32/epi64 cross 128-bit lane boundaries that
+      NEON cannot in one op. Replace permutexvar_epi8 with vqtbl4q_u8 (NEON
+      table-lookup over four 128-bit halves on AArch64); shuffle_epi8 with
+      per-half vqtbl1q_u8; alignr_epi8 with vextq_u8 within each half plus
+      cross-half byte movement. _mm512_ternarylogic_epi32 with imm8 truth
+      table maps to a sequence of vandq / vorrq / veorq / vbicq derived from
+      the imm8 — emit the explicit boolean expression rather than a
+      table-driven helper.
+    metadata:
+      match_rules:
+        - pattern: "_mm512_permutexvar_(epi8|epi16|epi32|epi64|ps|pd)"
+          type: regex
+          scope: intrinsic_call
+          description: AVX-512 cross-lane permute by index vector
+        - pattern: "_mm512_shuffle_epi8"
+          type: regex
+          scope: intrinsic_call
+          description: AVX-512 byte shuffle (per-128 within each half on x86, but full vector when wired to vqtbl4q)
+        - pattern: "_mm512_alignr_epi8"
+          type: regex
+          scope: intrinsic_call
+          description: AVX-512 cross-lane byte align
+        - pattern: "_mm512_ternarylogic_(epi32|epi64)"
+          type: regex
+          scope: intrinsic_call
+          description: AVX-512 three-input boolean op with imm8 truth table
+    x64_constructs:
+      - _mm512_permutexvar_epi32
+      - _mm512_permutexvar_epi8
+      - _mm512_shuffle_epi8
+      - _mm512_alignr_epi8
+      - _mm512_ternarylogic_epi32
+    arm64_constructs:
+      - "Cross-lane byte permute (full 64-byte vector): uint8x16x4_t tbl = { v0, v1, v2, v3 }; result_half = vqtbl4q_u8(tbl, idx_half);   // AArch64 only"
+      - "Per-half shuffle_epi8: rK = vqtbl1q_u8(vK, idxK);   // four independent shuffles"
+      - "alignr_epi8 with imm8 byte count K: rK = vextq_u8(prevK, vK, K);   // within each half plus cross-half data movement when K crosses 16-byte boundaries"
+      - "ternarylogic with imm8 truth table — derive the boolean expression from imm8 and emit it directly: e.g., imm8=0x96 (a^b^c) → veorq_u8(a, veorq_u8(b, c)); imm8=0xE2 ((a&b)|(~a&c)) → vbslq_u8(a, b, c)"
+    pitfalls:
+      - "vqtbl4q_u8 is AArch64-only — no ARMv7 equivalent; gate the cross-lane permute on __aarch64__"
+      - "_mm512_shuffle_epi8 on x86 is per-128-bit (acts independently within each lane); the NEON port must respect that and not promote to vqtbl4q unless the source AVX-512 code intentionally needed cross-lane behaviour"
+      - "_mm512_ternarylogic_epi32 imm8 → boolean expression mapping is mechanical but easy to get wrong — always verify against a truth-table generator and a unit test on randomised inputs"
+      - "vextq_u8 takes a compile-time imm — do not pass a runtime variable as the byte offset"
+    validation_criteria:
+      - Cross-lane permute uses vqtbl4q_u8 only under __aarch64__ guard
+      - Per-128-bit shuffle uses four independent vqtbl1q_u8 calls when AVX-512 semantics are per-lane
+      - ternarylogic is replaced by an explicit boolean expression matching its imm8 truth table
+      - Unit tests cover representative imm8 values (identity, swap, broadcast, zero) for each permute / shuffle site

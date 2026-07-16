@@ -1,0 +1,173 @@
+version: "1.0"
+generated_from: skills/asm-x64-to-arm64/references/specs/inline-asm-constraints.md
+description: >
+  GCC extended inline-asm rules for porting asm volatile / __asm__ blocks from
+  x64 to arm64: constraint letters, operand width modifiers, clobber list,
+  memory operand restrictions, compiler barriers, and condition-code outputs.
+
+specs:
+  - id: 1
+    name: named-register-constraints
+    category: inline-asm-constraints
+    description: >
+      x64 uses architecture-specific constraint letters (=a, =c, =d, =S, =D, =b)
+      to force a named register; arm64 has no equivalent and must use generic
+      =r for GP registers and =w for NEON/FP registers.
+    metadata:
+      match_rules:
+        - pattern: "\"=[acdSDb]\""
+          type: regex
+          scope: expression
+          description: x64 named-register output constraint letters
+        - pattern: "\"\\+[acdSDb]\""
+          type: regex
+          scope: expression
+          description: x64 named-register read-write constraint letters
+        - pattern: "\"=[acdSDb]\\d*\""
+          type: regex
+          scope: expression
+          description: x64 named-register input constraint letters
+    x64_constructs:
+      - 'asm volatile ("rdtsc" : "=a"(lo), "=d"(hi))'
+      - '"=a"(result) for forcing eax/rax output'
+    arm64_constructs:
+      - '"=r"(out) for any GP register'
+      - '"=w"(vec) for NEON/FP register'
+    pitfalls:
+      - x64 named-register letters do not exist in the arm64 backend — compile error
+      - Using "=r" where "=w" is required allocates a GP register and the FP/NEON instruction fails to assemble
+    validation_criteria:
+      - No "=a" / "=b" / "=c" / "=d" / "=S" / "=D" constraint letters remain in arm64 path
+      - NEON/FP outputs use "=w"; integer outputs use "=r"
+
+  - id: 2
+    name: operand-width-modifiers
+    category: inline-asm-constraints
+    description: >
+      arm64 inline asm requires explicit %w (32-bit) or %x (64-bit) operand
+      modifiers; x64 picks register width from the operand type. Mismatching
+      modifier and instruction width is a silent runtime bug.
+    metadata:
+      match_rules:
+        - pattern: "asm\\s+(volatile\\s+)?\\(\"[^\"]*%\\d"
+          type: regex
+          scope: expression
+          description: Inline asm template using bare %0/%1 operand references without width modifier
+        - pattern: "%[wx]\\d+"
+          type: regex
+          scope: expression
+          description: arm64 width-annotated operand reference
+    x64_constructs:
+      - 'asm ("addq %1, %0" : "+r"(out) : "r"(in))'
+    arm64_constructs:
+      - 'asm ("add %x0, %x1, %x2" : "=r"(out) : "r"(a), "r"(b))   // 64-bit'
+      - 'asm ("add %w0, %w1, %w2" : "=r"(out) : "r"(a), "r"(b))   // 32-bit'
+    pitfalls:
+      - Writing to %w0 zero-extends to x0; writing to %x0 does not preserve prior upper bits
+      - 8-bit/16-bit sub-register access (al, ax) on x64 has no arm64 equivalent — use ubfx/uxtb/uxth instead
+    validation_criteria:
+      - Every operand reference in arm64 inline asm uses %w or %x
+      - 32-bit operations use %w; 64-bit operations use %x consistently with the instruction
+
+  - id: 3
+    name: clobber-list-translation
+    category: inline-asm-constraints
+    description: >
+      Replace x64 named-register clobbers with arm64 register names actually
+      used by the template. "cc" and "memory" are architecture-neutral. Every
+      flag-setting instruction in the template requires "cc" in the clobber list.
+    metadata:
+      match_rules:
+        - pattern: ":\\s*\"(eax|ebx|ecx|edx|esi|edi|r\\d+)\""
+          type: regex
+          scope: expression
+          description: x64 register names appearing in clobber list
+        - pattern: "\\b(adds|subs|ands|cmp|tst)\\b"
+          type: regex
+          scope: instruction
+          description: arm64 flag-setting instructions that require "cc" clobber
+    x64_constructs:
+      - 'asm volatile ("cpuid" :: : "eax", "ebx", "ecx", "edx", "memory")'
+    arm64_constructs:
+      - 'asm volatile ("dmb ish" ::: "memory")'
+      - 'asm ("subs %x0, %x1, %x2" : "=r"(d) : "r"(a), "r"(b) : "cc")'
+    pitfalls:
+      - Forgetting "cc" when using a flag-setting instruction lets the compiler assume flags survive — corrupts surrounding code
+      - Listing x64 register names like "eax" in arm64 clobber is a compile error
+    validation_criteria:
+      - Clobber list contains only arm64 register names or "cc" / "memory"
+      - Every flag-setting instruction in the template has "cc" in the clobber list
+
+  - id: 4
+    name: memory-operand-constraint
+    category: inline-asm-constraints
+    description: >
+      arm64 "m" memory operand only generates simple [xN] or [xN, #imm12]
+      addressing (12-bit unsigned offset scaled by access size). x64 complex
+      addressing must be computed into an "r"-bound variable before the asm.
+    metadata:
+      match_rules:
+        - pattern: "\"m\"\\(\\w+\\[.+[*+].+\\]\\)"
+          type: regex
+          scope: expression
+          description: Complex memory operand with index/scale/displacement
+        - pattern: "\"m\"\\("
+          type: regex
+          scope: expression
+          description: Any "m" memory operand requiring arm64 review
+    x64_constructs:
+      - 'asm ("movl %1, %0" : "=r"(v) : "m"(arr[i*4 + 8]))'
+    arm64_constructs:
+      - 'uintptr_t addr = (uintptr_t)&arr[i] + 8; asm ("ldr %w0, [%1]" : "=r"(v) : "r"(addr))'
+    pitfalls:
+      - Complex "m" often compiles but emits multi-instruction address materialization; benchmark to confirm
+    validation_criteria:
+      - All "m" operands correspond to simple base or base+offset addresses
+      - Complex pointer arithmetic is computed into a "r"-bound variable before the asm block
+
+  - id: 5
+    name: compiler-barrier-only
+    category: inline-asm-constraints
+    description: >
+      asm volatile ("" ::: "memory") is a compiler barrier and translates
+      verbatim. It is NOT a hardware barrier — code that relied on x64 TSO
+      ordering needs dmb ish / ldar / stlr on arm64.
+    metadata:
+      match_rules:
+        - pattern: "asm\\s+volatile\\s*\\(\\s*\"\"\\s*:::\\s*\"memory\"\\s*\\)"
+          type: regex
+          scope: expression
+          description: Empty-template compiler barrier idiom
+    x64_constructs:
+      - 'asm volatile ("" ::: "memory")'
+    arm64_constructs:
+      - 'asm volatile ("" ::: "memory")   // unchanged'
+    pitfalls:
+      - Compiler barrier is not hardware barrier; x64 TSO-relying code needs dmb ish or ldar/stlr on arm64
+    validation_criteria:
+      - The empty-template compiler barrier translates unchanged
+      - asm blocks relying on x64 strong ordering are cross-checked against memory-model-and-atomics
+
+  - id: 6
+    name: condition-code-output-constraint
+    category: inline-asm-constraints
+    description: >
+      GCC flag-output constraint name differs by architecture. x64 "=@ccz"
+      becomes arm64 "=@cceq"; carry-flag forms invert: x64 "=@ccc" → arm64
+      "=@cclo" (NOT "=@cccs").
+    metadata:
+      match_rules:
+        - pattern: "\"=@cc[a-z]+\""
+          type: regex
+          scope: expression
+          description: GCC flag-output constraint
+    x64_constructs:
+      - 'asm ("cmp %1, %2" : "=@ccz"(eq) : "r"(a), "r"(b) : "cc")'
+      - '"=@ccc"(carry)   // x64 carry flag'
+    arm64_constructs:
+      - 'asm ("cmp %x1, %x2" : "=@cceq"(eq) : "r"(a), "r"(b) : "cc")'
+      - '"=@cclo"(below)   // arm64 unsigned-below'
+    pitfalls:
+      - x64 "=@ccc" → arm64 "=@cclo", NOT "=@cccs" — the carry-flag polarity differs after a cmp
+    validation_criteria:
+      - All "=@cc<x>" constraints in arm64 path use arm64 condition codes (eq, ne, lo, hs, lt, ge, le, gt, mi, pl, vs, vc)

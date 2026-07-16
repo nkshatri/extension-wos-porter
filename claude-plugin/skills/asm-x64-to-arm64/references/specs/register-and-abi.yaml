@@ -1,0 +1,266 @@
+version: "1.0"
+generated_from: skills/asm-x64-to-arm64/references/specs/register-and-abi.md
+description: >
+  Register mapping and ABI rules for x64 (System V or Windows) to AAPCS64
+  (arm64) translation: argument registers, callee-saved sets, scratch
+  registers, special-purpose registers (XR, IP0/IP1, FP, LR, x18), TLS,
+  stack alignment, the red zone, and return-address handling.
+
+specs:
+  - id: 1
+    name: x64-abi-variant-identification
+    category: abi
+    description: >
+      Two incompatible x64 ABIs exist (System V AMD64 and Windows x64). Identify
+      which one the source targets before mapping arguments. AAPCS64 unifies the
+      arm64 side regardless of host OS.
+    metadata:
+      match_rules:
+        - pattern: "\\b(rdi|rsi)\\b"
+          type: regex
+          scope: instruction
+          description: SysV-only first/second-arg registers — implies SysV source
+        - pattern: "shadow\\s*space|sub\\s+rsp\\s*,\\s*(20h|32)\\b"
+          type: regex
+          scope: instruction
+          description: Windows x64 caller shadow-space allocation
+    x64_constructs:
+      - "mov rax, rdi             ; SysV first arg"
+      - "sub rsp, 32              ; Windows shadow space"
+    arm64_constructs:
+      - "mov x0, x0               ; AAPCS64 first arg already in x0"
+      - "(no shadow space on AAPCS64)"
+    pitfalls:
+      - Misidentifying SysV as Windows or vice versa silently swaps argument register order; the asm runs without crashing but produces wrong results
+    validation_criteria:
+      - Source ABI is documented or inferred from build files before translation
+      - Argument-register references in the body match AAPCS64 regardless of source ABI
+
+  - id: 2
+    name: argument-register-mapping
+    category: abi
+    description: >
+      AAPCS64 places integer args 1-8 in x0-x7, FP/SIMD args 1-8 in v0-v7.
+      x8 is XR (indirect-result-pointer), a dedicated register, not general
+      scratch.
+    metadata:
+      match_rules:
+        - pattern: "\\b(rdi|rsi|rdx|rcx|r8|r9)\\b"
+          type: regex
+          scope: instruction
+          description: x64 SysV argument registers
+        - pattern: "\\b(xmm[0-7])\\b"
+          type: regex
+          scope: instruction
+          description: x64 FP/SIMD argument registers
+    x64_constructs:
+      - "mov rax, rdi      ; SysV arg1"
+      - "mov rax, rcx      ; Win arg1"
+    arm64_constructs:
+      - "// arg1 already in x0; arg2 in x1; ... arg8 in x7"
+      - "// FP arg1 in v0; ... FP arg8 in v7"
+    pitfalls:
+      - x8 is XR (indirect result), NOT a general scratch register on AAPCS64 — using it as scratch corrupts struct-by-reference returns
+      - 32-bit args use w0-w7, not x0-x7
+      - "Register MAPPING (where an arg arrives) is not the same as the contract (what it means). The argument's role/unit and, for pointers, which stride advances it, come from the destination's declaration / reference implementation — NOT the x64 source's conventions. Hand-written x64 asm often hard-codes a private convention (e.g. a fixed source stride, a reused register) that is not part of the portable contract; copying it verbatim compiles, links, runs, and is silently wrong. Always derive the contract from the callee declaration and diff numeric output against the reference."
+    validation_criteria:
+      - All argument registers in arm64 body are within x0-x7 / v0-v7
+      - x8 is used only for indirect result pointer, never as scratch
+      - Each argument's role, unit, and (for pointers) governing stride is taken from the destination declaration / reference implementation, and the ported body matches it
+      - Numeric output is diffed against the reference implementation (and that check is itself failure-tested), not assumed from the register mapping
+
+  - id: 3
+    name: callee-saved-register-set
+    category: abi
+    description: >
+      AAPCS64 callee-saved GP set is x19-x28 plus x29 (FP) and x30 (LR).
+      Callee-saved SIMD set is v8-v15, but only the lower 64 bits (d8-d15).
+      x18 is platform-reserved, NOT callee-saved.
+    metadata:
+      match_rules:
+        - pattern: "push\\s+(rbx|rbp|rsi|rdi|r1[2-5])"
+          type: regex
+          scope: instruction
+          description: x64 callee-saved register save (Intel syntax)
+        - pattern: "%(rbx|rbp|r1[2-5])"
+          type: regex
+          scope: instruction
+          description: x64 SysV callee-saved register
+    x64_constructs:
+      - "push rbx; push r12; push r13   ; SysV"
+      - "push rbx; push rsi; push rdi   ; Windows"
+    arm64_constructs:
+      - "stp x19, x20, [sp, #-32]!"
+      - "stp x21, x22, [sp, #16]"
+    pitfalls:
+      - Saving the top half of v8-v15 is wasted work — only d8-d15 are callee-saved
+      - x18 is platform-reserved (Windows TEB / Apple), NOT callee-saved; never use it
+    validation_criteria:
+      - Saved GP register set is a subset of x19-x28, x29, x30
+      - Saved SIMD register set is a subset of v8-v15 (saving only the d half)
+      - x18 is never written
+
+  - id: 4
+    name: caller-saved-scratch-set
+    category: abi
+    description: >
+      x0-x18 are caller-saved on AAPCS64 (with x18 reserved for the platform).
+      v0-v7 and v16-v31 are caller-saved SIMD. x16 (IP0) and x17 (IP1) may be
+      overwritten by the linker across a bl.
+    metadata:
+      match_rules:
+        - pattern: "\\b(x1[6-7]|ip[01])\\b"
+          type: regex
+          scope: instruction
+          description: arm64 IP0/IP1 (linker veneer scratch) usage
+    x64_constructs:
+      - "// values held in rax/rcx/rdx across a call must be spilled"
+    arm64_constructs:
+      - "// values held in x0-x18 across bl must be spilled"
+      - "// x16/x17 may be clobbered by linker veneer across bl"
+    pitfalls:
+      - x16/x17 may be overwritten by linker-inserted PLT or range-extension veneers between an asm bl and its target
+    validation_criteria:
+      - Callee-saved values are not held in x0-x18 or v0-v7/v16-v31 across a bl call
+      - x16/x17 are not relied on across bl
+
+  - id: 5
+    name: special-purpose-registers
+    category: abi
+    description: >
+      x29 (FP) is required on Apple platforms for stack unwinding; x30 (LR)
+      holds the return address; x8 (XR) is dedicated for indirect result;
+      x18 is platform-reserved.
+    metadata:
+      match_rules:
+        - pattern: "\\bx18\\b"
+          type: regex
+          scope: instruction
+          description: arm64 platform-reserved register (must never be written)
+        - pattern: "\\b(x29|fp|x30|lr)\\b"
+          type: regex
+          scope: instruction
+          description: arm64 frame-pointer or link-register usage
+    x64_constructs:
+      - "// rbp optional frame pointer; return address pushed by call"
+    arm64_constructs:
+      - "stp x29, x30, [sp, #-16]!     ; non-leaf prologue"
+      - "mov x29, sp"
+      - "ldp x29, x30, [sp], #16; ret  ; non-leaf epilogue"
+    pitfalls:
+      - x29 omission breaks Apple stack unwinding for non-leaf functions
+      - x18 writes corrupt platform state (TEB on Windows, scratch on Apple)
+    validation_criteria:
+      - All non-leaf functions save FP+LR in their prologue
+      - x18 is unwritten throughout the file
+
+  - id: 6
+    name: tls-access
+    category: abi
+    description: >
+      arm64 has no segment-prefix addressing. mrs x0, tpidr_el0 (Linux) or
+      tpidrro_el0 (Apple read-only) loads the TLS base pointer; the variable
+      offset is then a normal load.
+    metadata:
+      match_rules:
+        - pattern: "\\b(fs|gs):\\["
+          type: regex
+          scope: instruction
+          description: x64 segment-prefix TLS access
+        - pattern: "\\b(fs|gs):0x"
+          type: regex
+          scope: instruction
+          description: x64 segment-prefix with hex offset
+    x64_constructs:
+      - "mov rax, fs:[0x28]    ; SysV stack canary"
+      - "mov rax, gs:[0x30]    ; Windows TEB"
+    arm64_constructs:
+      - "mrs x0, tpidr_el0; ldr x1, [x0, #0x28]"
+      - "mrs x0, tpidrro_el0   ; Apple"
+    pitfalls:
+      - Some kernels disable user-space access to certain tpidr* registers — verify on the target platform
+    validation_criteria:
+      - No segment-prefix (fs:, gs:) addressing remains
+      - TLS access uses mrs + offset load pattern
+
+  - id: 7
+    name: stack-alignment
+    category: abi
+    description: >
+      arm64 SP must be 16-byte aligned at every instruction; x64 SP only at
+      call sites. Single 8-byte SP adjustments are not allowed on arm64; use
+      stp/ldp pairs or multiples of 16.
+    metadata:
+      match_rules:
+        - pattern: "(str|ldr)\\s+\\w+\\s*,\\s*\\[sp,\\s*#-?[0-9]+\\]!?"
+          type: regex
+          scope: instruction
+          description: arm64 single-register SP-relative store/load with pre/post-index
+        - pattern: "(sub|add)\\s+sp\\s*,\\s*sp\\s*,\\s*#[0-9]+"
+          type: regex
+          scope: instruction
+          description: arm64 SP adjustment
+    x64_constructs:
+      - "sub rsp, 8         ; permitted at non-call sites"
+    arm64_constructs:
+      - "sub sp, sp, #16    ; multiples of 16 only"
+      - "stp x19, x20, [sp, #-16]!    ; pair save"
+      - "str x19, [sp, #-16]!         ; padded single save"
+    pitfalls:
+      - str x19, [sp, #-8]! crashes on hardware alignment exception, but only on real ARM64 — emulators may tolerate it, hiding the bug until production
+    validation_criteria:
+      - All SP adjustments are multiples of 16
+      - Single-register saves pad to 16 ([sp, #-16]!) or use STP for register pairs
+
+  - id: 8
+    name: no-red-zone
+    category: abi
+    description: >
+      arm64 has no red zone. Memory below SP is unsafe — signals or IRQs may
+      clobber it. Asm that relied on x64 SysV's 128-byte red zone must
+      explicitly allocate stack space.
+    metadata:
+      match_rules:
+        - pattern: "\\[\\s*rsp\\s*-\\s*\\d+\\s*\\]"
+          type: regex
+          scope: instruction
+          description: x64 access below RSP (potential red-zone usage)
+        - pattern: "\\[\\s*sp\\s*,\\s*#-\\d+\\s*\\](?!!)"
+          type: regex
+          scope: instruction
+          description: arm64 access below SP without writeback (UNSAFE)
+    x64_constructs:
+      - "mov [rsp - 16], rax    ; SysV leaf — red-zone use"
+    arm64_constructs:
+      - "sub sp, sp, #16; str x0, [sp]; ...; add sp, sp, #16"
+    pitfalls:
+      - Red-zone usage is implicit in the x64 source — it does not show as `sub rsp, ...`. Spotting it requires noticing memory accesses below the current RSP
+    validation_criteria:
+      - All stack-frame uses in arm64 path are above the current SP, never below
+
+  - id: 9
+    name: return-address-handling
+    category: abi
+    description: >
+      x64 call pushes the return address; arm64 bl writes it to x30 (LR).
+      Non-leaf functions must save x30 (typically with x29) in prologue and
+      restore in epilogue.
+    metadata:
+      match_rules:
+        - pattern: "\\bbl\\s+\\w+"
+          type: regex
+          scope: instruction
+          description: arm64 branch-with-link (call) instruction
+        - pattern: "\\bret\\b"
+          type: regex
+          scope: instruction
+          description: function return instruction
+    x64_constructs:
+      - "call func; ...; ret"
+    arm64_constructs:
+      - "stp x29, x30, [sp, #-16]!; ...; bl func; ...; ldp x29, x30, [sp], #16; ret"
+    pitfalls:
+      - Forgetting to save x30 before a nested bl overwrites the outer return address — function returns to the wrong site, often crashing far from the actual bug
+    validation_criteria:
+      - All non-leaf functions save and restore x30 in prologue/epilogue
+      - ret is the last instruction of every function (no fall-through)

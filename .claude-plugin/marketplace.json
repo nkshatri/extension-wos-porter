@@ -1,0 +1,28 @@
+{
+  "name": "extension-wos-porter",
+  "owner": {
+    "name": "qualcomm",
+    "url": "https://github.com/qualcomm"
+  },
+  "metadata": {
+    "description": "Windows on Arm porting tools for Claude Code.",
+    "version": "1.0.2"
+  },
+  "plugins": [
+    {
+      "name": "wos-porter",
+      "source": "./claude-plugin",
+      "description": "Port open-source x64 Windows apps to native ARM64 — analyze, port build+source, build, validate binaries with dumpbin, run tests, and apply hand-written NEON optimizations.",
+      "version": "1.0.2",
+      "license": "BSD-3-Clause-Clear",
+      "keywords": [
+        "arm64",
+        "aarch64",
+        "porting",
+        "windows",
+        "simd",
+        "neon"
+      ]
+    }
+  ]
+}

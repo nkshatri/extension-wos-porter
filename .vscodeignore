@@ -28,3 +28,8 @@ tsconfig.json
 
 # Packaged output artefacts
 *.vsix
+
+# Claude Code plugin packaging (installed via the Claude Code marketplace from
+# GitHub, not used by the VS Code extension at runtime)
+claude-plugin/**
+.claude-plugin/**

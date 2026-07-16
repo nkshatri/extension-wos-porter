@@ -1,6 +1,6 @@
-# WoS Porter — Windows ARM64 Porting Agent for GitHub Copilot
+# WoS Porter — Windows ARM64 Porting Agent
 
-AI-powered agents that automatically port open-source x64 Windows applications to native ARM64.
+AI-powered agents that automatically port open-source x64 Windows applications to native ARM64. Ships in two forms from this one repo: a **GitHub Copilot** VS Code extension and a **Claude Code** plugin (see [Using It in Claude Code](#using-it-in-claude-code-plugin)).
 
 ## What It Does
 
@@ -69,9 +69,20 @@ Loaded on demand — never in the always-visible system prompt.
 
 ## Requirements
 
-- [Visual Studio 2022](https://visualstudio.microsoft.com/) with the **MSVC ARM64 build tools** workload installed
+**For the VS Code / GitHub Copilot extension:**
+
+- [Visual Studio 2022](https://visualstudio.microsoft.com/) with the **MSVC v143 - ARM64/ARM64EC build tools** and **Windows 11 SDK**
 - [GitHub Copilot](https://marketplace.visualstudio.com/items?itemName=GitHub.copilot) extension
 - VS Code 1.100+
+- `git` on PATH
+
+**For the Claude Code plugin:**
+
+- [Claude Code](https://docs.claude.com/en/docs/claude-code) installed and authenticated
+- [Visual Studio 2022](https://visualstudio.microsoft.com/) with the **MSVC v143 - ARM64/ARM64EC build tools** and **Windows 11 SDK**
+- `git` on PATH
+
+(See [`claude-plugin/README.md`](claude-plugin/README.md#prerequisites) for the full Claude Code prerequisites and install steps.)
 
 ### Optional environment variables
 
@@ -131,124 +142,66 @@ You can also invoke individual agents directly:
 - `wos-tester` — Run and fix ARM64 test suites and benchmarks
 - `wos-optimizer` — Apply ARM NEON intrinsics to hot kernels
 
-## Using the Agents in Claude Code
+## Using It in Claude Code (plugin)
 
-In [Claude Code](https://docs.claude.com/en/docs/claude-code) the recommended setup mirrors the VS Code extension: install the four asset categories (agents, instructions, skills, prompts) under `~/.claude/` (or `.claude/` for a single project), and expose two slash commands — `/wos-porter` for the full pipeline and `/wos-verify-port` for the Phase 8 semantic gate.
+The same agents, skills, prompts, and reference material are also packaged as a **Claude Code plugin** under [`claude-plugin/`](claude-plugin/). You do **not** need to copy files into `~/.claude/` by hand — Claude Code installs the plugin from this repository through its marketplace mechanism.
 
-The agents refer to their sibling instructions/skills/prompts via **relative paths** (e.g. `../skills/wos-toolchain-discovery/SKILL.md`). Preserving the four sibling folders under one root — `~/.claude/` or `.claude/` — keeps every link working with no rewrites.
+### Install from GitHub
 
-### Layout
+1. Open Claude Code in any project.
+2. Add this repository as a marketplace (it advertises the plugin via the root `.claude-plugin/marketplace.json`):
+
+   ```
+   /plugin marketplace add qualcomm/extension-wos-porter
+   ```
+
+   Pin a branch if the plugin isn't on the default branch yet:
+
+   ```
+   /plugin marketplace add qualcomm/extension-wos-porter@refactor
+   ```
+
+3. Install the plugin:
+
+   ```
+   /plugin install wos-porter@extension-wos-porter
+   ```
+
+4. Confirm it loaded with `/plugin` (you should see **wos-porter** enabled).
+
+### Install from a local clone
+
+Point the marketplace at your checkout root (the folder containing `.claude-plugin/marketplace.json`), then install:
 
 ```
-~/.claude/                                (or .claude/ for one project)
-├── agents/          wos-*.md             (7 files)
-├── instructions/    wos-*.instructions.md (9 files — reference material)
-├── skills/          wos-*/SKILL.md        (4 dirs)
-├── prompts/         wos-verify-port.prompt.md
-└── commands/        wos-porter.md, wos-verify-port.md
+/plugin marketplace add C:\path\to\extension-wos-porter
+/plugin install wos-porter@extension-wos-porter
 ```
 
-### 1. Install the seven agents
+### Run it
 
-Copy them from the extension's install location (`~/.copilot/agents/`) into `.claude/agents/`, renaming `*.agent.md` → `*.md`:
-
-```bash
-mkdir -p ~/.claude/agents
-for f in ~/.copilot/agents/wos-*.agent.md; do
-  name=$(basename "$f" .agent.md)
-  cp "$f" "$HOME/.claude/agents/$name.md"
-done
+```
+/wos-porter:wos-porter https://github.com/user/repo
 ```
 
-Claude Code and VS Code Copilot use slightly different frontmatter keys. In each copied agent, adjust:
+This command runs the full 8-phase pipeline **in the main conversation** — it reads the `wos-porter` agent's instructions and spawns the six `wos-*` sub-agents itself (sub-agents cannot spawn further sub-agents). The Phase 8 verification gate (`G1`–`G8`) in [`claude-plugin/prompts/wos-verify-port.prompt.md`](claude-plugin/prompts/wos-verify-port.prompt.md) runs inline before `ARM64-PORT.md` is written. Ported code stays local on an `arm64-port` branch; `main`/`master` is never modified.
 
-| Copilot key | Claude Code subagent key |
+See [`claude-plugin/README.md`](claude-plugin/README.md) for the full step-by-step install, usage, uninstall, and troubleshooting guide.
+
+### How the plugin maps to the Copilot assets
+
+| Copilot asset (this repo) | Claude Code plugin location |
 |---|---|
-| `tools: [execute, read, edit, search, todo, agent]` | `tools: Bash, Read, Edit, Write, Grep, Glob, TodoWrite, Task` (or omit to grant all) |
-| `description`, `name` | keep as-is |
-| `argument-hint`, `user-invocable`, `agents` | remove |
-
-Tool mapping: `execute`→`Bash`, `read`→`Read`, `edit`→`Edit`/`Write`, `search`→`Grep`/`Glob`, `todo`→`TodoWrite`, `agent`→`Task`. **`wos-porter` must keep the `Task` tool** so it can invoke the other six subagents.
-
-### 2. Install the instructions, skills, and prompts
-
-These are plain markdown; copy them verbatim so the relative links inside the agents resolve:
-
-```bash
-mkdir -p ~/.claude/instructions ~/.claude/skills ~/.claude/prompts
-cp -R ~/.copilot/instructions/* ~/.claude/instructions/
-cp -R ~/.copilot/skills/*       ~/.claude/skills/
-cp -R ~/.copilot/prompts/*      ~/.claude/prompts/
-```
-
-Notes:
-
-- **Instructions** use `applyTo` frontmatter in VS Code; Claude Code ignores that key. The recipe files are loaded on demand by the agents via markdown links, so the `applyTo` glob is inert but harmless.
-- **Skills** are stored one-directory-per-skill (`skills/wos-neon-reference/SKILL.md`, etc.). The agents `read` them on demand, so Claude Code treats them as plain reference documents.
-- **Prompts** are Claude Code's closest equivalent of the VS Code prompt file, but they are exposed to the user via the slash command layer (see next step).
-
-### 3. Create the two slash commands
-
-`.claude/commands/wos-porter.md`:
-
-```markdown
----
-description: Port an open-source x64 application to Windows ARM64.
-argument-hint: <github-repo-url>
-allowed-tools: Task
----
-
-Use the **wos-porter** subagent to port the following repository to native
-Windows ARM64. Run its full pipeline — analyze, port the build system and
-source, build, validate with dumpbin, test, and optimize — delegating each
-phase to the wos-analyzer, wos-build-porter, wos-code-porter, wos-builder,
-wos-tester, and wos-optimizer subagents. Load skills and instructions on
-demand as directed by the agent body (e.g. wos-toolchain-discovery,
-wos-neon-reference, wos-forbidden-skip-reasons, and the per-build-system
-recipe instructions).
-
-Repository: $ARGUMENTS
-```
-
-`.claude/commands/wos-verify-port.md` (Phase 8 gate — the same content as `prompts/wos-verify-port.prompt.md`, callable as a slash command):
-
-```markdown
----
-description: Run the Windows ARM64 port verification gates G1–G8 against the on-disk repo.
-argument-hint: <repoName>
-allowed-tools: Bash, Read, Grep, Glob
----
-
-Follow the verification workflow in ~/.claude/prompts/wos-verify-port.prompt.md
-against repo "$ARGUMENTS" (expected under $WOS_PORTER_WORKDIR if set,
-otherwise C:\src\wos-porter\$ARGUMENTS on Windows or ~/wos-porter/$ARGUMENTS
-elsewhere). Re-derive toolchain state via the wos-toolchain-discovery skill,
-run every gate (G1–G8), and report failures without proceeding to the
-ARM64-PORT.md report.
-```
-
-### 4. Run it
-
-Type `/` to confirm both commands are listed, then invoke the full pipeline:
-
-```
-> /wos-porter https://github.com/user/repo
-```
-
-Claude Code launches `wos-porter`, which spawns the analyzer, porters, builder, tester, and optimizer subagents. When it reaches Phase 8, either the porter agent invokes the verify workflow inline, or you can run it manually:
-
-```
-> /wos-verify-port repo
-```
-
-Run `/agents` to verify all seven subagents loaded.
+| `agents/wos-*.agent.md` | `claude-plugin/agents/wos-*.md` (frontmatter converted to Claude subagent spec) |
+| `prompts/wos-verify-port.prompt.md` | `claude-plugin/prompts/wos-verify-port.prompt.md` |
+| `instructions/wos-*.instructions.md` | `claude-plugin/references/wos-*.md` (loaded on demand) |
+| `skills/wos-*/SKILL.md` | `claude-plugin/skills/wos-*/SKILL.md` (verbatim) |
+| entry point | `claude-plugin/commands/wos-porter.md` → `/wos-porter:wos-porter` |
 
 ### Token-saving notes for Claude Code
 
-The same design that reduces per-turn tokens in VS Code applies here:
-
 - The 7 agent `description` fields are short (~150 chars each) so the router keeps them cheap.
-- Instructions load only when the agent explicitly reads them (there is no `applyTo` auto-load in Claude Code, so linking-on-demand is the whole strategy).
+- References load only when an agent explicitly reads them (there is no `applyTo` auto-load in Claude Code — linking on demand is the whole strategy).
 - Skills are read only when a specific task needs them (e.g. `wos-toolchain-discovery` on Phase 4 / 5 / 6 / 8 rather than every turn).
 - `wos-toolchain-discovery` caches its result to `<repo>\.copilot\state\wos-toolchain.json`; every subsequent phase reads the cache instead of re-invoking `vswhere`.
 

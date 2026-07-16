@@ -1,0 +1,409 @@
+version: "1.0"
+generated_from: skills/sse-avx-to-neon/references/specs/crc32-pmull.md
+description: >
+  Detailed reference for porting x86 PCLMULQDQ-based CRC32 to ARM NEON
+  PMULL — feature guards, named clmul lane-select macros, helper
+  constructors (xor3, set_u32x4, set_u64x2), CRC-32/ISO-HDLC polynomial
+  constants, fold_state_N pipeline patterns, the Chorba large-buffer
+  folding algorithm, and the full Barrett reduction sequence (128→32 bit).
+
+specs:
+  - id: 1
+    name: arm-crc-algorithm-choice-hw-plus-pmull
+    category: algorithm-choice
+    description: >
+      A literal PCLMULQDQ -> PMULL transcription is usually NOT the fastest
+      ARM CRC (measured 0.30x of upstream on zlib-ng, 14.3 vs 48.0 GB/s).
+      Unlike x86, AArch64 with +crc has a hardware CRC32 instruction
+      (__crc32b/h/w/d) on a separate execution port from PMULL. The fastest
+      ARM CRC runs scalar hardware-CRC lanes IN PARALLEL with wide PMULL
+      folding in the same loop (e.g. 9-way PMULL fold / 144B interleaved with
+      3-way __crc32d / 48B = 192 bytes/iter), combined with EOR3
+      (veor3q_u64, __ARM_FEATURE_SHA3) to fuse the two fold XORs and the data
+      load into one instruction. When porting an x86 PCLMULQDQ CRC: if the
+      target has +crc, write the hardware-CRC + PMULL hybrid as the PRIMARY
+      kernel and treat the PMULL-only fold as the no-+crc fallback. Reference:
+      corsix/fast-crc32 and zlib-ng arch/arm/crc32_armv8_pmull_eor3.c.
+    metadata:
+      match_rules:
+        - pattern: "_mm_clmulepi64_si128\\s*\\("
+          type: regex
+          scope: intrinsic_call
+          description: x86 carryless-multiply CRC — decide ARM algorithm (HW-CRC+PMULL hybrid) BEFORE transcribing
+        - pattern: "_mm(256|512)?_clmulepi64_epi128\\s*\\("
+          type: regex
+          scope: intrinsic_call
+          description: VPCLMULQDQ wide carryless multiply — same algorithm-choice decision applies
+        - pattern: "__crc32(b|h|w|d)\\b"
+          type: regex
+          scope: intrinsic_call
+          description: ARM hardware CRC32 instruction — the parallel scalar lane in the fast hybrid
+        - pattern: "veor3q_u64|__ARM_FEATURE_SHA3"
+          type: regex
+          scope: intrinsic_call
+          description: EOR3 fold-XOR fusion used by the fast ARM CRC kernel
+    x64_constructs:
+      - "All-PMULL CRC: _mm_clmulepi64_si128 fold loop (x86 has no hardware CRC primitive other than CRC32C/SSE4.2)"
+      - "VPCLMULQDQ wide fold: _mm512_clmulepi64_epi128"
+    arm64_constructs:
+      - "PRIMARY (+crc): scalar __crc32d lanes interleaved with N-way PMULL fold in ONE loop body, EOR3-combined, ~192B/iter"
+      - "Tree-reduce the N PMULL fold accumulators to 1, Barrett-reduce to 32 bits, then CRC-combine with the scalar lanes"
+      - "BASELINE (+crc, no PMULL): plain __crc32b/h/w/d byte/halfword/word/doubleword chain"
+      - "BASELINE (+crc, no PMULL): the hardware-CRC-only kernel from spec 2 (arm-crc-hardware-baseline)"
+      - "FALLBACK (no +crc): the PMULL-only fold_state_N kernel from specs 7-9"
+    pitfalls:
+      - Transliterating the x86 PMULL-only fold leaves ~2-3x on the table on any +crc-capable AArch64 part
+      - Running the scalar __crc32d phase and the PMULL fold phase sequentially (not interleaved) wastes the parallel ports — they MUST share one loop body
+      - Forgetting to gate EOR3 on __ARM_FEATURE_SHA3 breaks the build on parts without SHA3
+      - Skipping the plain hardware-CRC baseline variant hurts small/medium buffers where fold setup does not amortize
+    validation_criteria:
+      - On a +crc target the primary kernel uses __crc32* AND vmull_p64 in the same hot loop
+      - A PMULL-only path exists only as the no-+crc fallback, not as the main kernel
+      - Throughput at >=1 MiB is benchmarked against the prior implementation and is ~2-3x the PMULL-only port
+
+  - id: 2
+    name: arm-crc-hardware-baseline
+    category: algorithm-choice
+    description: >
+      The +crc BASELINE variant of a CRC port (the "->ARMv8 +crc baseline"
+      porting items) is NOT a PMULL fold and NOT the HW+PMULL hybrid — it is a
+      pure hardware-CRC chain using the ARMv8 CRC32 instructions __crc32b / h /
+      w / d (feature __ARM_FEATURE_CRC32, "+crc"). It consumes the buffer 8
+      bytes at a time with __crc32d in a simple loop, with __crc32w/h/b
+      handling the sub-8-byte head/tail. This is the correct target for the
+      *-armv8-crc and *-vpclmulqdq-*-armv8-crc items: they exist precisely as
+      the no-PMULL / no-SHA3 path for smaller buffers and for parts that lack
+      PMULL+EOR3. Do NOT translate the x86 PCLMULQDQ carryless-multiply fold
+      here — that algorithm belongs to the pmull-eor3 sibling item (spec 1).
+      For the highest-throughput kernel that runs these __crc32* lanes IN
+      PARALLEL with PMULL folding, see spec 1 (arm-crc-algorithm-choice).
+    metadata:
+      match_rules:
+        # --- x86 SOURCE trigger: the SAME PCLMULQDQ source feeds both the
+        # pmull-eor3 item and its "->ARMv8 +crc baseline" sibling (they share
+        # source bytes in a variant_group). This rule makes the baseline spec a
+        # screening CANDIDATE on that shared source; LLM refinement then routes
+        # spec 1 (hybrid) to the *-pmull-eor3 item and spec 2 (this baseline) to
+        # the *-armv8-crc item by title / target_feature. Without an x86-source
+        # trigger this spec could never be selected (it would only fire on ARM
+        # output that does not exist at screening time).
+        - pattern: "_mm_clmulepi64_si128\\s*\\("
+          type: regex
+          scope: intrinsic_call
+          description: x86 PCLMULQDQ CRC source — the +crc baseline is this item's no-PMULL sibling variant
+        - pattern: "_mm(256|512)?_clmulepi64_epi128\\s*\\("
+          type: regex
+          scope: intrinsic_call
+          description: VPCLMULQDQ CRC source — same baseline-sibling routing applies
+        # --- ARM-output / x86-CRC32C self-check rules ---
+        - pattern: "__crc32(b|h|w|d)\\b"
+          type: regex
+          scope: intrinsic_call
+          description: ARM hardware CRC32 instruction — the baseline +crc kernel
+        - pattern: "__ARM_FEATURE_CRC32"
+          type: exact
+          scope: preprocessor
+          description: Feature macro gating the hardware-CRC baseline path
+        - pattern: "_mm_crc32_u(8|16|32|64)\\s*\\("
+          type: regex
+          scope: intrinsic_call
+          description: x86 SSE4.2 hardware CRC (CRC32C) — direct analog mapping to __crc32* on ARM
+    x64_constructs:
+      - "SSE4.2 _mm_crc32_u64 / _mm_crc32_u32 hardware-CRC chain (CRC32C polynomial)"
+      - "Scalar table-driven CRC fallback when CRC32 ISA is absent"
+    arm64_constructs:
+      - "crc0 = __crc32d(crc0, *(const uint64_t*)buf); buf += 8;  # 8-byte main loop"
+      - "Head/tail: __crc32w (4B), __crc32h (2B), __crc32b (1B)"
+      - "Guard the whole path with #if defined(__ARM_FEATURE_CRC32)"
+    pitfalls:
+      - Do NOT port the PCLMULQDQ fold into the baseline item — that is the pmull-eor3 variant's job (spec 1)
+      - zlib/gzip CRC-32 (poly 0xEDB88320, reflected) matches ARM __crc32* directly; CRC32C (Castagnoli, SSE4.2 _mm_crc32_*) is a DIFFERENT polynomial — confirm which one the source computes before mapping
+      - __crc32d takes a uint64_t lane; feeding misaligned/byte-swapped data corrupts the result
+      - Missing the __ARM_FEATURE_CRC32 guard breaks the build on pre-ARMv8.1 targets without +crc
+    validation_criteria:
+      - Baseline kernel uses only __crc32b/h/w/d (no vmull_p64, no fold_state_N)
+      - The whole path is guarded by __ARM_FEATURE_CRC32
+      - Source polynomial (ISO-HDLC vs Castagnoli) verified to match the chosen __crc32* mapping
+
+  - id: 3
+    name: pmull-feature-guard-and-headers
+    category: feature-guard
+    description: >
+      PMULL-based CRC paths must be gated by __ARM_FEATURE_PMULL and
+      include both <arm_neon.h> and <arm_acle.h> (the latter provides
+      vmull_p64, vmull_high_p64, poly64_t, poly128_t). Project-specific
+      capability macros (e.g., ARM_PMULL in zlib-ng) must be mapped to
+      __ARM_FEATURE_PMULL at the guard level; standard intrinsics are
+      used inside.
+    metadata:
+      match_rules:
+        - pattern: "__ARM_FEATURE_PMULL"
+          type: exact
+          scope: preprocessor
+          description: Standard compiler-defined macro indicating PMULL support
+        - pattern: "ARM_PMULL"
+          type: exact
+          scope: preprocessor
+          description: Project-specific PMULL capability macro (e.g., zlib-ng)
+        - pattern: "<arm_acle\\.h>"
+          type: regex
+          scope: preprocessor
+          description: ACLE header providing vmull_p64 / poly128_t
+    x64_constructs:
+      - "#ifdef __PCLMUL__"
+      - "#include <wmmintrin.h>"
+    arm64_constructs:
+      - "#ifdef __ARM_FEATURE_PMULL"
+      - "#include <arm_neon.h>"
+      - "#include <arm_acle.h>"
+    pitfalls:
+      - Forgetting <arm_acle.h> — vmull_p64 and poly128_t become unresolved
+      - Using project-specific macros like ARM_PMULL inside the body instead of standard names
+      - Missing the feature guard causes link failures on cores without PMULL
+    validation_criteria:
+      - PMULL code path is wrapped in #ifdef __ARM_FEATURE_PMULL
+      - Both <arm_neon.h> and <arm_acle.h> are included on the ARM path
+
+  - id: 4
+    name: clmul-lane-select-macros
+    category: intrinsic-mapping
+    description: >
+      _mm_clmulepi64_si128 has four imm8 lane-select variants
+      (0x00/0x01/0x10/0x11). Each maps to a specific combination of
+      vgetq_lane_p64 / vmull_p64 or vmull_high_p64. Define four named
+      macros (clmul_lo_lo / clmul_hi_lo / clmul_lo_hi / clmul_hi_hi) and
+      use them at call sites — never inline the reinterpret chain.
+    metadata:
+      match_rules:
+        - pattern: "_mm_clmulepi64_si128"
+          type: exact
+          scope: intrinsic_call
+          description: x86 carryless multiply with imm8 lane select
+        - pattern: "vmull_p64"
+          type: exact
+          scope: intrinsic_call
+          description: NEON polynomial 64x64→128 multiply (low lanes)
+        - pattern: "vmull_high_p64"
+          type: exact
+          scope: intrinsic_call
+          description: NEON polynomial 64x64→128 multiply (high lanes)
+    x64_constructs:
+      - "_mm_clmulepi64_si128(a, b, 0x00)"
+      - "_mm_clmulepi64_si128(a, b, 0x01)"
+      - "_mm_clmulepi64_si128(a, b, 0x10)"
+      - "_mm_clmulepi64_si128(a, b, 0x11)"
+    arm64_constructs:
+      - "clmul_lo_lo(a, b): vmull_p64 of lane 0 of both"
+      - "clmul_hi_lo(a, b): vmull_p64 of lane 1 of a, lane 0 of b"
+      - "clmul_lo_hi(a, b): vmull_p64 of lane 0 of a, lane 1 of b"
+      - "clmul_hi_hi(a, b): vmull_high_p64 of both"
+      - "Wrap result with vreinterpretq_u8_p128"
+    pitfalls:
+      - imm8 lane selection differs between lo/hi macros — using the wrong macro silently produces wrong CRC
+      - Inlining the reinterpret + vgetq_lane chain at call sites obscures intent and invites typos
+      - Forgetting vreinterpretq_u8_p128 leaves a poly128_t that won't compose with other u8 NEON ops
+      - "MSVC vs ACLE vmull_p64 lane form DIVERGES — a single portable spelling does not exist for the lo/hi variants. GCC/Clang vmull_p64 takes a scalar poly64_t (poly64_t is a 64-bit int; extract with `vgetq_lane_p64(vreinterpretq_p64_u8(x), n)`). MSVC's vmull_p64 maps to neon_pmull_64(__n64, __n64) and takes a VECTOR poly64x1_t lane (extract with `vget_low_p64` / `vget_high_p64`; MSVC's poly64_t is the opaque __n64, so scalar (poly64_t) casts fail to compile). Split the lo_lo/hi_lo/lo_hi macros on `#if defined(_MSC_VER)`; the hi_hi variant (vmull_high_p64 over the whole Q-reg) is identical on both. NEVER write `(poly64_t)some_uint64` — it works on GCC/Clang and breaks on MSVC."
+      - "MSVC ARM64 rejects aggregate brace-init of NEON vector types (`uint32x4_t v = {a,b,c,d}` → C2078 too many initializers). Build constant vectors from a plain array via `vld1q_u32(tmp)` / `vld1q_u8(tmp)` instead — portable across GCC/Clang/MSVC. poly128_t is also unnamed on MSVC; only use the p128 result through vreinterpretq_u8_p128(), never as a named type."
+    validation_criteria:
+      - All four imm8 variants of _mm_clmulepi64_si128 covered by named macros
+      - vmull_high_p64 is used only for the hi/hi variant
+      - Result types are uint8x16_t after vreinterpretq_u8_p128
+      - "lo/hi clmul macros compile on BOTH GCC/Clang and MSVC ARM64 (verify the _MSC_VER split: vget_low_p64/vget_high_p64 on MSVC, vgetq_lane_p64 on ACLE); no scalar (poly64_t) casts and no NEON-vector brace-init remain"
+
+  - id: 5
+    name: clmul-helper-macros-and-constructors
+    category: intrinsic-mapping
+    description: >
+      Helpers that recur in CRC PMULL code: xor3 (three-operand XOR
+      replacing nested veorq_u8 pairs in fold-step expressions),
+      set_u32x4 (drop-in for _mm_set_epi32 with NEON-native lane order),
+      and set_u64x2 (drop-in for _mm_set_epi64x). Note that
+      _mm_set_epi32 takes args in high→low order — these helpers use
+      the natural low→high NEON layout instead.
+    metadata:
+      match_rules:
+        - pattern: "_mm_set_epi32"
+          type: exact
+          scope: intrinsic_call
+          description: SSE 4x32-bit set with high→low argument order
+        - pattern: "_mm_set_epi64x"
+          type: exact
+          scope: intrinsic_call
+          description: SSE 2x64-bit set
+        - pattern: "veorq_u8\\s*\\(\\s*veorq_u8"
+          type: regex
+          scope: expression
+          description: Nested veorq_u8 pair that should use xor3
+    x64_constructs:
+      - "_mm_set_epi32(e3, e2, e1, e0)"
+      - "_mm_set_epi64x(hi, lo)"
+      - "nested _mm_xor_si128(_mm_xor_si128(a,b), c)"
+    arm64_constructs:
+      - "xor3(a, b, c) = veorq_u8(veorq_u8(a, b), c)"
+      - "set_u32x4(e0, e1, e2, e3) — natural lane order"
+      - "set_u64x2(hi, lo) using vcombine_u64(vcreate_u64(lo), vcreate_u64(hi))"
+    pitfalls:
+      - _mm_set_epi32 argument order is high→low (e3 first); set_u32x4 uses low→high (e0 first) — do not mirror the order blindly
+      - vcombine_u64 takes (low, high) — passing (hi, lo) puts the words in the wrong lanes
+      - xor3 only saves an instruction on cores without three-input fused XOR — do not over-apply
+    validation_criteria:
+      - _mm_set_epi32 calls translate to set_u32x4 with reversed arg order
+      - _mm_set_epi64x calls translate to set_u64x2 with arg order preserved (hi, lo)
+      - Triple-XOR fold expressions use xor3 rather than nested veorq_u8
+
+  - id: 6
+    name: crc32-iso-hdlc-polynomial-constants
+    category: constants
+    description: >
+      Standard CRC-32/ISO-HDLC fold/Barrett constants (polynomial
+      0xEDB88320, used by zlib/gzip/PNG/Ethernet): fold4 (k1/k2 for
+      64-byte fold), fold12 (Chorba large-buffer path), k12 (fold
+      4×128-bit → 1×128-bit), barrett_k (Barrett reduction quadruple:
+      mu_lo, mu_hi, poly_lo, poly_hi), and the initial CRC seed
+      0x9db42487 placed in lane 0. Substitute polynomial-specific
+      constants for non-CRC-32 variants.
+    metadata:
+      match_rules:
+        - pattern: "0xc6e41596|0x54442bd4|0xccaa009e|0x751997d0|0xf7011641|0xb4e5b025|0x9db42487"
+          type: regex
+          scope: expression
+          description: Known CRC-32/ISO-HDLC fold or Barrett constant
+        - pattern: "fold4|fold12|barrett_k"
+          type: regex
+          scope: declaration
+          description: Standard CRC fold/Barrett constant identifiers
+    x64_constructs:
+      - SSE versions of these constants built with _mm_set_epi32 / _mm_set_epi64x
+    arm64_constructs:
+      - "fold4 = set_u32x4(0xc6e41596, 1, 0x54442bd4, 1)"
+      - "fold12 = set_u64x2(0x596C8D81, 0xF5E48C85)"
+      - "k12 = set_u32x4(0xccaa009e, 0, 0x751997d0, 1)"
+      - "barrett_k = set_u32x4(0xf7011641, 0xb4e5b025, 0xdb710640, 1)"
+      - "crc0 = vsetq_lane_u32(0x9db42487, vdupq_n_u32(0), 0) reinterpreted as u8"
+    pitfalls:
+      - These constants are CRC-32-specific — using them for other polynomials produces wrong results
+      - The lane order of fold4 / barrett_k matches set_u32x4 (low→high); reversing the order corrupts the fold
+      - Initial CRC seed must occupy u32 lane 0 only; other lanes must be zero
+    validation_criteria:
+      - Constants match the listed values bit-for-bit
+      - Lane order follows set_u32x4 / set_u64x2 conventions
+      - Initial crc0 has 0x9db42487 in lane 0 and zeroes elsewhere
+
+  - id: 7
+    name: fold-state-pipeline-pattern
+    category: algorithm-pattern
+    description: >
+      fold_state_N functions advance a 4-register fold pipeline by
+      folding N registers (using clmul_hi_lo + clmul_lo_hi + veorq_u8
+      per register) and rotating the remaining registers to make room.
+      fold_state_4 folds all four in place (steady state); fold_state_1
+      / _2 / _3 fold only the exiting registers and rotate
+      crc0→crc1→crc2→crc3, placing fold results into the vacated
+      positions for handling tails of fewer than 4 full 16-byte blocks.
+    metadata:
+      match_rules:
+        - pattern: "fold_state_[1-4]"
+          type: regex
+          scope: function_call
+          description: 4-register fold pipeline step (matches the named pattern)
+        - pattern: "clmul_hi_lo|clmul_lo_hi"
+          type: regex
+          scope: intrinsic_call
+          description: Carryless multiply pair used inside fold step
+    x64_constructs:
+      - x86 PCLMULQDQ fold loop body using _mm_clmulepi64_si128 with imm8 0x10 / 0x01
+      - Inline _mm_xor_si128 of fold halves
+    arm64_constructs:
+      - "fold_state_4: fold all 4 registers in-place via clmul_hi_lo + clmul_lo_hi + veorq_u8"
+      - "fold_state_1/2/3: rotate crc0..crc3 by N positions, fold only exiting registers"
+      - "Output: updated *crc0..*crc3 ready for next iteration"
+    pitfalls:
+      - Using fold_state_4 in the tail produces wrong results — rotation is required to drop spent registers
+      - Mixing up clmul_hi_lo and clmul_lo_hi changes the fold polynomial alignment
+      - Forgetting to dereference pointer outputs leaves the caller with stale values
+      - "CRASH RISK: the fold pipeline assumes len >= one full 16-byte block. The kernel entry MUST guard `if (len < 16) return <scalar-fallback>(crc, src, len)` BEFORE any unconditional `vld1q_u8(src)` / `len -= 16`. The x86 PCLMULQDQ template has this short-buffer branch; transcribing only the main fold loop drops it. Without it, short buffers read out of bounds AND `len -= 16` underflows size_t into a huge value, turning the next `while (len >= ...)` into an unbounded OOB walk → segfault. This also bites the `if (crc != 0)` initial-CRC fold, which loads 16 bytes unconditionally. Every variant in the family (4-fold, 8-lane/avx2, 9-lane/eor3) needs the same guard; a wider variant may simply delegate `len < its_stride` to the proven narrower kernel, but the narrowest kernel still needs the `< 16` scalar fallback."
+    validation_criteria:
+      - The N in fold_state_N matches the number of remaining 16-byte blocks at that point
+      - Each register fold uses one clmul_hi_lo + one clmul_lo_hi + one veorq_u8
+      - Steady-state loop body uses fold_state_4 only
+      - "Kernel entry guards len < 16 (and len < initial-fold-stride) with a scalar fallback before any unconditional 16-byte load; verified by benchmarking/fuzzing len in {0,1,8,15,16,17} with a non-zero initial crc, not just large aligned buffers"
+
+  - id: 8
+    name: chorba-large-buffer-folding
+    category: algorithm-pattern
+    description: >
+      For large buffers, the Chorba algorithm (arxiv 2412.16398) hides
+      PMULL latency by interleaving 8 seed blocks (chorba1..chorba8)
+      with fold steps over 8 inner iterations of 64 bytes each, for a
+      512-byte stride. Each inner iteration calls fold_state_12 (first
+      iteration) or fold_state_4 (subsequent), loads/stores 4×16 bytes
+      of input, then XORs the per-iteration seeds into crc0..crc3
+      according to the paper's mixing coefficients. Applies to any
+      PMULL-based CRC, not only CRC-32.
+    metadata:
+      match_rules:
+        - pattern: "chorba"
+          type: prefix
+          scope: function_call
+          description: Chorba folding helper or block label
+        - pattern: "fold_state_12"
+          type: exact
+          scope: function_call
+          description: Initial 12-register Chorba fold step
+    x64_constructs:
+      - Standard PCLMULQDQ-based CRC32 inner loop processing 64 or 128 bytes per iteration
+    arm64_constructs:
+      - "8 × 16-byte chorba seed loads (chorba1..chorba8)"
+      - "8 inner iterations: fold_state_12 (first) or fold_state_4 + 4 input loads/stores + 4 seed XORs"
+      - "Stride: src += 512, dst += 512, len -= 512 per outer iteration"
+    pitfalls:
+      - The per-iteration seed mixing coefficients are paper-specific — reordering them silently breaks CRC
+      - Chorba only pays off above a buffer-size threshold; using it on small inputs adds overhead
+      - The first inner iteration uses fold_state_12; using fold_state_4 there is wrong
+    validation_criteria:
+      - Stride is exactly 512 bytes per outer iteration
+      - 8 chorba seeds are loaded and stored per outer iteration when copying
+      - Mixing matches Saving Computing Resources with Chorba paper coefficients
+
+  - id: 9
+    name: barrett-reduction-128-to-32
+    category: algorithm-pattern
+    description: >
+      Barrett reduction reduces the final 128-bit fold accumulator down
+      to a 32-bit CRC: clmul_lo_lo then clmul_lo_hi against barrett_k,
+      isolate u32 lane 2 (replacing _mm_blend_epi16(zero, x, 0xcf) with
+      vgetq_lane_u32 + vsetq_lane_u32), XOR with crc3, then clmul_hi_lo
+      and clmul_lo_hi again, and extract the final CRC from lane 2.
+      The final result is bitwise-NOT-ed (~crc).
+    metadata:
+      match_rules:
+        - pattern: "barrett"
+          type: prefix
+          scope: function_call
+          description: Barrett reduction helper or constant identifier
+        - pattern: "_mm_blend_epi16\\s*\\(.*0xcf"
+          type: regex
+          scope: intrinsic_call
+          description: x86 idiom that becomes vgetq_lane_u32 + vsetq_lane_u32 in NEON
+        - pattern: "vgetq_lane_u32\\s*\\(.*,\\s*2\\s*\\)"
+          type: regex
+          scope: intrinsic_call
+          description: Final CRC extract from lane 2 in Barrett reduction
+    x64_constructs:
+      - x86 Barrett reduction sequence using _mm_clmulepi64_si128 + _mm_blend_epi16 + _mm_extract_epi32
+    arm64_constructs:
+      - "x_tmp0 = clmul_lo_lo(crc3, barrett_k)"
+      - "x_tmp1 = clmul_lo_hi(x_tmp0, barrett_k)"
+      - "isolate u32 lane 2: vsetq_lane_u32(vgetq_lane_u32(x_tmp1, 2), vdupq_n_u32(0), 2)"
+      - "x_tmp0 = veorq_u8(x_tmp1, crc3)"
+      - "x_res_a = clmul_hi_lo(x_tmp0, barrett_k); x_res_b = clmul_lo_hi(x_res_a, barrett_k)"
+      - "return ~vgetq_lane_u32(vreinterpretq_u32_u8(x_res_b), 2)"
+    pitfalls:
+      - The final ~ is part of the CRC-32/ISO-HDLC spec — forgetting it produces an inverted CRC
+      - Lane 2 (not 0 or 3) holds the result — reading the wrong lane silently corrupts output
+      - _mm_blend_epi16(zero, x, 0xcf) keeps bytes 8-11 only; the NEON equivalent must zero everything else
+      - Mixing up clmul_hi_lo vs clmul_lo_hi in the second pair changes the reduction polynomial
+    validation_criteria:
+      - Sequence matches lo_lo → lo_hi → isolate-lane-2 → XOR with crc3 → hi_lo → lo_hi → extract-lane-2 → bitwise NOT
+      - barrett_k is the CRC-32 value defined in the constants spec
+      - Final return value is the bitwise-NOT of lane 2

@@ -1,0 +1,195 @@
+version: "1.0"
+generated_from: skills/asm-x64-to-arm64/references/specs/flags-and-conditions.md
+description: >
+  EFLAGS-vs-NZCV translation rules: S-suffix flag-setting discipline, EFLAGS
+  bits with no arm64 equivalent (AF/DF/PF), inverted carry polarity after cmp,
+  conditional branch mnemonic mapping, CMOV-to-CSEL, and the CSDB speculation
+  barrier.
+
+specs:
+  - id: 1
+    name: s-suffix-flag-discipline
+    category: flags
+    description: >
+      x64 sets EFLAGS implicitly on most arithmetic; arm64 sets NZCV only when
+      the instruction carries S-suffix (adds, subs, ands, cmp, tst). Any branch
+      reading flags must be preceded by an S-form instruction.
+    metadata:
+      match_rules:
+        - pattern: "\\b(add|sub|and|or|xor|inc|dec)\\s+\\w+\\s*,\\s*\\w+\\s*\\n\\s*j(nz|ne|z|eq|b|a|be|ae|l|g|le|ge|c|s|o)\\b"
+          type: regex
+          scope: instruction
+          description: x64 arithmetic followed by conditional branch (implicit flag set)
+        - pattern: "\\b(add|sub|and)\\s+\\w+\\s*,\\s*\\w+\\s*,\\s*\\w+\\s*\\n\\s*b\\.(eq|ne|lo|hs|ls|hi|lt|le|gt|ge|mi|pl|vs|vc)\\b"
+          type: regex
+          scope: instruction
+          description: arm64 NON-flag-setting arithmetic followed by conditional branch (BUG)
+    x64_constructs:
+      - "sub rax, 1"
+      - "jnz .loop"
+    arm64_constructs:
+      - "subs x0, x0, #1"
+      - "b.ne .loop"
+    pitfalls:
+      - Defaulting to non-S form silently breaks any branch that reads flags
+      - orr/eor/bic/orn have NO S-suffix form; if x64 did `or rax, rbx; jz`, the arm64 port must add an explicit cmp/cbz after orr
+    validation_criteria:
+      - Every b.<cc> reads flags set by an immediately preceding S-suffix instruction or cmp/tst
+      - No b.<cc> follows a non-flag-setting add/sub/and
+      - orr/eor/etc. that need to set flags are followed by an explicit cmp or cbz/cbnz
+
+  - id: 2
+    name: eflags-no-arm64-equivalent
+    category: flags
+    description: >
+      x64 EFLAGS bits AF (auxiliary carry), DF (direction), and PF (parity)
+      have no arm64 NZCV equivalent. Code reading these bits requires
+      algorithmic rewrite, not direct translation.
+    metadata:
+      match_rules:
+        - pattern: "\\b(setp|setnp|jp|jnp)\\b"
+          type: regex
+          scope: instruction
+          description: x64 parity-flag instruction (no arm64 equivalent)
+        - pattern: "\\b(std|cld)\\b"
+          type: regex
+          scope: instruction
+          description: x64 direction-flag set/clear (used by string instructions)
+        - pattern: "\\bdaa|aaa|das|aas\\b"
+          type: regex
+          scope: instruction
+          description: x64 BCD instructions reading AF (no arm64 equivalent)
+        - pattern: "\\b(pushfq|popfq|pushf|popf)\\b"
+          type: regex
+          scope: instruction
+          description: x64 EFLAGS save/restore (no full equivalent on arm64)
+    x64_constructs:
+      - "std; rep movsb           ; backward copy via DF"
+      - "setp al                  ; capture parity"
+      - "pushfq; ...; popfq       ; save/restore all flags"
+    arm64_constructs:
+      - "// rewrite as ldr/str loop with explicit decrement"
+      - "// parity: eor reduction or table lookup"
+      - "// mrs/msr nzcv saves only N/Z/C/V; AF/DF/PF cannot be saved"
+    pitfalls:
+      - pushfq/popfq has no full arm64 equivalent — most code only needs N/Z/C/V, but if AF/DF/PF were relied on, the port is impossible without algorithmic rewrite
+    validation_criteria:
+      - No reads of AF/DF/PF remain (no setp, std/cld, BCD instructions)
+      - pushfq/popfq patterns are reviewed for required flag bits
+
+  - id: 3
+    name: carry-polarity-after-cmp
+    category: flags
+    description: >
+      After cmp, x64 CF=1 iff unsigned a<b; arm64 C=1 iff unsigned a>=b —
+      opposite polarity. Use named conditions b.lo/b.hs/b.ls/b.hi which
+      encode unsigned comparison directly.
+    metadata:
+      match_rules:
+        - pattern: "\\bb\\.(cs|cc)\\b"
+          type: regex
+          scope: instruction
+          description: arm64 b.cs/b.cc — review for inverted-carry pitfall
+        - pattern: "\\bsbb\\b"
+          type: regex
+          scope: instruction
+          description: x64 sub-with-borrow (carry polarity differs in arm64 sbcs)
+    x64_constructs:
+      - "cmp rax, rbx; jb .L      ; unsigned <"
+      - "sbb rax, rbx              ; CF=1 means borrow"
+    arm64_constructs:
+      - "cmp x0, x1; b.lo .L       ; unsigned <"
+      - "sbcs x0, x0, x1           ; C=1 means NO borrow"
+    pitfalls:
+      - sbb→sbcs polarity differs; if asm reads the flag back as a value, negate via cset+sub
+      - Using b.cs/b.cc with x64-mental-model carry semantics gives wrong direction
+    validation_criteria:
+      - Unsigned comparison branches use b.lo / b.hs / b.ls / b.hi
+      - Multi-precision subtract chains (sbcs) account for inverted carry polarity
+
+  - id: 4
+    name: conditional-branch-mnemonic-mapping
+    category: control-flow
+    description: >
+      Translate every j<cc> to b.<cc>. loop becomes subs+b.ne. jecxz/jrcxz
+      becomes cbz/cbnz (no flag effect, cheaper than cmp+b.eq).
+    metadata:
+      match_rules:
+        - pattern: "\\bj(e|z|ne|nz|l|le|g|ge|b|c|nae|be|na|a|nbe|ae|nc|nb|s|ns|o|no|p|np|cxz|ecxz|rcxz)\\b"
+          type: regex
+          scope: instruction
+          description: x64 conditional branch instruction
+        - pattern: "\\bloop[ne]?\\s+\\w+"
+          type: regex
+          scope: instruction
+          description: x64 loop instruction (decrement-rcx-and-branch)
+    x64_constructs:
+      - "je .L     ; jne .L     ; jl .L"
+      - "loop .body"
+      - "jrcxz .skip"
+    arm64_constructs:
+      - "b.eq .L; b.ne .L; b.lt .L"
+      - "subs x8, x8, #1; b.ne .body"
+      - "cbz x1, .skip"
+    pitfalls:
+      - cbz/cbnz only test for zero and do NOT set NZCV — cannot substitute for jz/jnz if a later conditional instruction depends on the same flags
+    validation_criteria:
+      - All j<cc> mnemonics translate to corresponding b.<cc> form
+      - loop is rewritten as subs+b.ne
+      - Plain register-vs-zero branches use cbz/cbnz where possible
+
+  - id: 5
+    name: cmov-to-csel-cset
+    category: control-flow
+    description: >
+      x64 cmov<cc> is 2-operand; arm64 csel is 3-operand. Collapse to 2-op
+      shape via csel \dst, \src_true, \dst, \cc. cmov from memory must be
+      ldr+csel. setb-style flag-to-bool becomes cset.
+    metadata:
+      match_rules:
+        - pattern: "\\bcmov(z|nz|e|ne|l|le|g|ge|b|be|a|ae|s|ns|o|no)\\b"
+          type: regex
+          scope: instruction
+          description: x64 conditional move
+        - pattern: "\\bset(z|nz|e|ne|l|le|g|ge|b|be|a|ae|s|ns|o|no)\\b"
+          type: regex
+          scope: instruction
+          description: x64 set-byte-on-condition
+    x64_constructs:
+      - "cmovz rax, rbx"
+      - "cmovz rax, [rcx]"
+      - "setb dl"
+    arm64_constructs:
+      - "csel x0, x1, x0, eq"
+      - "ldr x2, [x1]; csel x0, x2, x0, eq"
+      - "cset w3, lo"
+    pitfalls:
+      - csel cannot take a memory operand directly — port cmov-from-memory as ldr + csel
+    validation_criteria:
+      - All cmov<cc> translate to csel (or cset for set-to-bool patterns)
+      - cmov from memory is rewritten as ldr + csel
+
+  - id: 6
+    name: csdb-speculation-barrier
+    category: speculation
+    description: >
+      x64 lfence used as Spectre speculation barrier maps to arm64 csdb, NOT
+      dmb ishld. dmb ishld is a memory-ordering barrier and does not stop
+      speculative execution.
+    metadata:
+      match_rules:
+        - pattern: "\\blfence\\b"
+          type: regex
+          scope: instruction
+          description: x64 lfence — review intent (memory order vs speculation)
+    x64_constructs:
+      - "lfence    ; speculation barrier"
+      - "lfence    ; load-load memory order"
+    arm64_constructs:
+      - "csdb      ; speculation barrier"
+      - "dmb ishld ; load-load memory barrier"
+    pitfalls:
+      - Using dmb ishld where csdb is needed leaves the speculation gadget intact — mitigation silently fails
+    validation_criteria:
+      - Every lfence translation is annotated with intent (memory order vs speculation)
+      - Spectre-mitigation uses of lfence map to csdb

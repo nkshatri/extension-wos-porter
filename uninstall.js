@@ -55,8 +55,18 @@ function copilotHome() {
     return path.join(home, '.copilot');
 }
 
+// Join a single path component onto a trusted base directory, guaranteeing the
+// result cannot escape that base: reduce `name` to a bare basename (strips any
+// `..`, nested segments, or absolute prefix), then resolve and assert the
+// result stays contained within `baseDir`.
 function safeJoin(baseDir, name) {
-    return path.join(baseDir, path.basename(name));
+    const base = path.resolve(baseDir);
+    const resolved = path.resolve(base, path.basename(name));
+    const rel = path.relative(base, resolved);
+    if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) {
+        throw new Error(`Refusing path outside base directory: ${name}`);
+    }
+    return resolved;
 }
 
 function tryUnlink(p) {

@@ -56,9 +56,21 @@ function targetInstructionsDir(): string { return path.join(copilotHome(), 'inst
 function targetSkillsDir(): string       { return path.join(copilotHome(), 'skills'); }
 function targetPromptsDir(): string      { return path.join(copilotHome(), 'prompts'); }
 
-// Sanitize to a bare basename before joining so a manifest entry cannot traverse.
+// Join a single path component onto a trusted base directory, guaranteeing the
+// result cannot escape that base. Two layers of defense:
+//   1. Reduce `name` to a bare basename — strips any `..`, nested segments, or
+//      absolute-path prefix, so a manifest entry can only ever be one component.
+//   2. Resolve the result and assert it is still contained within `baseDir`.
+// This is the single sanitizer every file operation below flows through; there
+// is no un-validated `path.join` of a name onto a directory anywhere else.
 function safeJoin(baseDir: string, name: string): string {
-    return path.join(baseDir, path.basename(name));
+    const base = path.resolve(baseDir);
+    const resolved = path.resolve(base, path.basename(name));
+    const rel = path.relative(base, resolved);
+    if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) {
+        throw new Error(`Refusing path outside base directory: ${name}`);
+    }
+    return resolved;
 }
 
 function copyFileSafe(src: string, dst: string): void {
@@ -69,8 +81,10 @@ function copyFileSafe(src: string, dst: string): void {
 function copyDirRecursive(srcDir: string, dstDir: string): void {
     fs.mkdirSync(dstDir, { recursive: true });
     for (const entry of fs.readdirSync(srcDir, { withFileTypes: true })) {
-        const s = path.join(srcDir, entry.name);
-        const d = path.join(dstDir, entry.name);
+        // entry.name is a single directory component from readdir; route it
+        // through safeJoin so the containment check applies uniformly.
+        const s = safeJoin(srcDir, entry.name);
+        const d = safeJoin(dstDir, entry.name);
         if (entry.isDirectory()) { copyDirRecursive(s, d); }
         else if (entry.isFile()) { copyFileSafe(s, d); }
     }
@@ -80,14 +94,15 @@ function installAll(context: vscode.ExtensionContext): void {
     const ext = context.extensionPath;
 
     // Agents
+    const agentsSrc = safeJoin(ext, 'agents');
     const agentsDst = targetAgentsDir();
     fs.mkdirSync(agentsDst, { recursive: true });
     for (const f of AGENT_FILES) {
-        copyFileSafe(safeJoin(path.join(ext, 'agents'), f), safeJoin(agentsDst, f));
+        copyFileSafe(safeJoin(agentsSrc, f), safeJoin(agentsDst, f));
     }
 
     // Instructions
-    const instructionsSrc = path.join(ext, 'instructions');
+    const instructionsSrc = safeJoin(ext, 'instructions');
     if (fs.existsSync(instructionsSrc)) {
         const instructionsDst = targetInstructionsDir();
         fs.mkdirSync(instructionsDst, { recursive: true });
@@ -98,7 +113,7 @@ function installAll(context: vscode.ExtensionContext): void {
     }
 
     // Skills (each is a directory with SKILL.md)
-    const skillsSrc = path.join(ext, 'skills');
+    const skillsSrc = safeJoin(ext, 'skills');
     if (fs.existsSync(skillsSrc)) {
         for (const d of SKILL_DIRS) {
             const src = safeJoin(skillsSrc, d);
@@ -110,7 +125,7 @@ function installAll(context: vscode.ExtensionContext): void {
     }
 
     // Prompts
-    const promptsSrc = path.join(ext, 'prompts');
+    const promptsSrc = safeJoin(ext, 'prompts');
     if (fs.existsSync(promptsSrc)) {
         const promptsDst = targetPromptsDir();
         fs.mkdirSync(promptsDst, { recursive: true });

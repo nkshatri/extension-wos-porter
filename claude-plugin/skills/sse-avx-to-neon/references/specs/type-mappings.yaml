@@ -1,0 +1,455 @@
+version: "1.0"
+generated_from: skills/sse-avx-to-neon/references/specs/type-mappings.md
+description: >
+  Comprehensive SSE/AVX intrinsic to ARM NEON intrinsic mapping tables —
+  arithmetic, bitwise logic, shift, compare, min/max/abs, load/store,
+  shuffle/permute/blend, conversion/cast, horizontal operations, FMA, and
+  multi-step recipes for intrinsics without direct NEON equivalents.
+
+specs:
+  - id: 1
+    name: arithmetic-int-and-float
+    category: intrinsic-mapping
+    description: >
+      Direct one-to-one mapping for SSE integer/float add, sub, mul, div,
+      including saturating variants. Float64 ops require AArch64. Division
+      and reciprocal/sqrt on ARMv7 need Newton-Raphson approximations.
+    metadata:
+      match_rules:
+        - pattern: "_mm_(add|sub)s?_epi(8|16|32|64)"
+          type: regex
+          scope: intrinsic_call
+          description: SSE integer add/sub including saturating variants
+        - pattern: "_mm_(adds|subs)_epu(8|16)"
+          type: regex
+          scope: intrinsic_call
+          description: SSE saturating unsigned add/sub
+        - pattern: "_mm_(mullo|mulhi|mul)_(epi16|epi32|epu32)"
+          type: regex
+          scope: intrinsic_call
+          description: SSE integer multiply (low/high/widening)
+        - pattern: "_mm_madd_epi16"
+          type: exact
+          scope: intrinsic_call
+          description: 16-bit multiply-add with widening to 32-bit
+        - pattern: "_mm_(add|sub|mul|div|sqrt|rcp|rsqrt)_(ps|pd)"
+          type: regex
+          scope: intrinsic_call
+          description: SSE float arithmetic including div / sqrt / reciprocal
+    x64_constructs:
+      - _mm_add_epi32 / _mm_sub_epi32 / _mm_mullo_epi32
+      - _mm_adds_epi16 / _mm_subs_epu8
+      - _mm_mulhi_epi16
+      - _mm_madd_epi16
+      - _mm_add_ps / _mm_div_ps / _mm_sqrt_ps / _mm_rcp_ps
+      - _mm_add_pd / _mm_mul_pd
+    arm64_constructs:
+      - vaddq_s32 / vsubq_s32 / vmulq_s32
+      - vqaddq_s16 / vqsubq_u8
+      - "see multi-step recipe for vmulhi (vmull + vshrn + vcombine)"
+      - "see multi-step recipe for vmadd (vmull + vpaddq)"
+      - vaddq_f32 / vdivq_f32 / vsqrtq_f32 (AArch64) / vrecpeq_f32 + Newton step
+      - vaddq_f64 / vmulq_f64 (AArch64 only)
+    pitfalls:
+      - vdivq_f32 / vsqrtq_f32 require AArch64 — on ARMv7 use vrecpeq + Newton-Raphson
+      - vrecpeq_f32 / vrsqrteq_f32 are estimates only — apply two NR steps for full precision
+      - All *_pd / float64x2_t intrinsics require AArch64 — guard with defined(__aarch64__)
+      - _mm_mulhi_epi16 has no direct NEON equivalent — needs vmull + vshrn recipe
+    validation_criteria:
+      - Each SSE arithmetic intrinsic mapped to its vXXXq_ NEON equivalent
+      - Float64 ops guarded with defined(__aarch64__)
+      - Division on ARMv7 uses Newton-Raphson reciprocal sequence
+
+  - id: 2
+    name: bitwise-logic-and-andnot
+    category: intrinsic-mapping
+    description: >
+      AND, OR, XOR map directly. ANDNOT has no NEON equivalent — synthesize
+      with vmvnq + vand. For float bitwise ops, reinterpret to uint32x4_t
+      first, then reinterpret back to float32x4_t after the operation.
+    metadata:
+      match_rules:
+        - pattern: "_mm_(and|or|xor|andnot)_si128"
+          type: regex
+          scope: intrinsic_call
+          description: SSE2 integer 128-bit bitwise logic
+        - pattern: "_mm_(and|or|xor|andnot)_(ps|pd)"
+          type: regex
+          scope: intrinsic_call
+          description: SSE float bitwise logic
+    x64_constructs:
+      - _mm_and_si128 / _mm_or_si128 / _mm_xor_si128
+      - _mm_andnot_si128(a, b)
+      - _mm_and_ps / _mm_or_ps / _mm_xor_ps
+      - _mm_andnot_ps(a, b)
+    arm64_constructs:
+      - vandq_s32 / vorrq_s32 / veorq_s32 (any integer lane type)
+      - "vandq_s32(vmvnq_s32(a), b)  for andnot"
+      - "vandq_u32(vmvnq_u32(a_u32), b_u32) + vreinterpretq_f32_u32(...) for float andnot"
+    pitfalls:
+      - NEON has no direct vandnotq — must apply vmvnq first
+      - _mm_andnot_si128(a, b) computes NOT(a) AND b — note the operand order
+      - Float bitwise ops require vreinterpretq_u32_f32 round-trip
+    validation_criteria:
+      - andnot expressions use vmvnq_<type> + vandq_<type>
+      - Float bitwise ops use vreinterpretq round-trip with uint32 lane type
+
+  - id: 3
+    name: shift-immediate-and-variable
+    category: intrinsic-mapping
+    description: >
+      Immediate shifts (compile-time count) map directly to vshlq_n / vshrq_n.
+      Variable shifts use vshlq_<type> with a vector of counts — positive count
+      is left shift, negative is right shift. Logical right uses unsigned lane
+      type, arithmetic right uses signed.
+    metadata:
+      match_rules:
+        - pattern: "_mm_s(ll|rl|ra)i_epi(16|32|64)"
+          type: regex
+          scope: intrinsic_call
+          description: SSE immediate shifts (compile-time constant count)
+        - pattern: "_mm_s(ll|rl|ra)_epi(16|32|64)"
+          type: regex
+          scope: intrinsic_call
+          description: SSE variable shifts (count in XMM register)
+    x64_constructs:
+      - _mm_slli_epi32(a, n)
+      - _mm_srli_epi32(a, n)  # logical right
+      - _mm_srai_epi32(a, n)  # arithmetic right
+      - _mm_sll_epi32(a, count)
+      - _mm_srl_epi32(a, count)
+      - _mm_sra_epi32(a, count)
+    arm64_constructs:
+      - vshlq_n_s32(a, n) / vshrq_n_u32(a, n) / vshrq_n_s32(a, n)
+      - "vshlq_s32(a, vdupq_n_s32(count))  # positive = left"
+      - "vshlq_u32(a, vdupq_n_s32(-count))  # negative = right"
+    pitfalls:
+      - Immediate shift count MUST be compile-time constant — vshlq_n_* will fail otherwise
+      - Logical right shift requires unsigned lane type (vshrq_n_u32)
+      - Arithmetic right shift requires signed lane type (vshrq_n_s32)
+      - For variable right shift, negate the count and pass to vshlq — do not use vshrq with a variable
+    validation_criteria:
+      - Compile-time shifts use vshlq_n / vshrq_n
+      - Variable shifts use vshlq_<type>(a, vdupq_n_s32(±count))
+      - Logical vs arithmetic right is determined by lane type signedness
+
+  - id: 4
+    name: compare-mask-result
+    category: intrinsic-mapping
+    description: >
+      NEON compare intrinsics (vceqq, vcgtq, vcltq, vcgeq, vcleq) return an
+      all-ones mask per lane like SSE. Result type is unsigned — cast back to
+      signed/float with vreinterpretq when needed. NaN-aware compares
+      (cmpneq, cmpord, cmpunord) need synthesized fallbacks.
+    metadata:
+      match_rules:
+        - pattern: "_mm_cmp(eq|gt|lt|ge|le|neq|ord|unord)_(epi8|epi16|epi32|ps|pd)"
+          type: regex
+          scope: intrinsic_call
+          description: SSE compare intrinsics (integer and float)
+    x64_constructs:
+      - _mm_cmpeq_epi32 / _mm_cmpgt_epi32 / _mm_cmplt_epi32
+      - _mm_cmpeq_ps / _mm_cmplt_ps / _mm_cmpge_ps
+      - _mm_cmpneq_ps / _mm_cmpord_ps / _mm_cmpunord_ps
+    arm64_constructs:
+      - "vceqq_s32(a, b) → cast with vreinterpretq_s32_u32"
+      - vcgtq_s32 / vcltq_s32 / vcgeq_s32 / vcleq_s32
+      - vceqq_f32 / vcltq_f32 / vcgtq_f32 / vcgeq_f32
+      - "vmvnq_u32(vceqq_f32(a, b)) for cmpneq"
+      - "vandq_u32(vceqq_f32(a, a), vceqq_f32(b, b)) for cmpord (both non-NaN)"
+    pitfalls:
+      - NEON compare returns uint mask — must vreinterpretq back to original lane type
+      - cmpneq has no direct NEON equivalent — invert vceqq result with vmvnq
+      - cmpord / cmpunord must be synthesized via self-compare to detect NaN
+    validation_criteria:
+      - Each compare result is reinterpreted to the original signed/float lane type
+      - NaN-aware compares are decomposed into vceqq + vmvnq / vandq / vorrq
+
+  - id: 5
+    name: min-max-abs
+    category: intrinsic-mapping
+    description: >
+      Element-wise min/max/abs intrinsics map directly to NEON vminq, vmaxq,
+      vabsq. Float64 variants require AArch64. Use signed (vminq_s8) vs
+      unsigned (vminq_u8) per the SSE intrinsic suffix.
+    metadata:
+      match_rules:
+        - pattern: "_mm_(min|max)_(epi|epu)(8|16|32)"
+          type: regex
+          scope: intrinsic_call
+          description: SSE integer min/max
+        - pattern: "_mm_(min|max)_(ps|pd)"
+          type: regex
+          scope: intrinsic_call
+          description: SSE float min/max
+        - pattern: "_mm_abs_epi(8|16|32)"
+          type: regex
+          scope: intrinsic_call
+          description: SSE integer absolute value
+    x64_constructs:
+      - _mm_min_epi8 / _mm_max_epu16 / _mm_min_epi32
+      - _mm_min_ps / _mm_max_ps
+      - _mm_min_pd / _mm_max_pd  # AArch64 only
+      - _mm_abs_epi8 / _mm_abs_epi32
+    arm64_constructs:
+      - vminq_s8 / vmaxq_u16 / vminq_s32
+      - vminq_f32 / vmaxq_f32
+      - vminq_f64 / vmaxq_f64 (AArch64 only)
+      - vabsq_s8 / vabsq_s16 / vabsq_s32
+    pitfalls:
+      - "*_pd / float64x2_t variants require AArch64 — guard with defined(__aarch64__)"
+      - Match signed vs unsigned lane type to the SSE suffix (epi vs epu)
+      - vabsq has no unsigned variant (no need — already non-negative)
+    validation_criteria:
+      - Each min/max/abs intrinsic mapped one-to-one to vXXXq_<type>
+      - Lane type signedness matches SSE epi/epu suffix
+
+  - id: 6
+    name: load-store-and-set
+    category: intrinsic-mapping
+    description: >
+      All SSE load/store intrinsics map to vld1q_<type> / vst1q_<type>. NEON
+      handles unaligned loads natively, so aligned and unaligned variants are
+      identical. _mm_set1_* maps to vdupq_n_<type>; setzero to vdupq_n_<type>(0).
+      For sequential bulk loads use _xN struct intrinsics.
+    metadata:
+      match_rules:
+        - pattern: "_mm_(load|loadu|store|storeu)_(si128|ps|pd)"
+          type: regex
+          scope: intrinsic_call
+          description: SSE 128-bit load/store intrinsics
+        - pattern: "_mm_set1_(epi8|epi16|epi32|epi64x|ps|pd)"
+          type: regex
+          scope: intrinsic_call
+          description: SSE broadcast scalar to vector
+        - pattern: "_mm_setzero_(si128|ps|pd)"
+          type: regex
+          scope: intrinsic_call
+          description: SSE zero-vector constructor
+    x64_constructs:
+      - _mm_load_si128 / _mm_loadu_si128
+      - _mm_load_ps / _mm_loadu_ps
+      - _mm_store_si128 / _mm_storeu_si128
+      - _mm_set1_epi32(v) / _mm_set1_ps(v)
+      - _mm_setzero_si128() / _mm_setzero_ps()
+    arm64_constructs:
+      - "vld1q_s32((int32_t*)p) (NEON handles unaligned natively)"
+      - "vld1q_f32(p)"
+      - "vst1q_s32((int32_t*)p, a) / vst1q_f32(p, a)"
+      - vdupq_n_s32(v) / vdupq_n_f32(v)
+      - "vdupq_n_s32(0) / vdupq_n_f32(0.0f)"
+      - "vld1q_<type>_xN / vst1q_<type>_xN for bulk sequential transfers"
+    pitfalls:
+      - aligned and unaligned loads collapse to same NEON intrinsic — no perf win from removing 'u'
+      - Cast pointer to the lane type when using vld1q_s32 etc. on void/__m128i sources
+      - For memory-bound loops, prefer _xN struct loads over N independent vld1q calls
+      - _ex alignment-hint variants are project-specific (zlib-ng) — not standard NEON
+    validation_criteria:
+      - All SSE loads/stores replaced with vld1q / vst1q
+      - set1 / setzero replaced with vdupq_n
+      - Bulk transfers use _xN where applicable
+
+  - id: 7
+    name: shuffle-permute-blend
+    category: intrinsic-mapping
+    description: >
+      _mm_unpacklo / _mm_unpackhi map cleanly to vzip1q / vzip2q (AArch64) or
+      vzipq + lane select (ARMv7). _mm_shuffle_epi32 has no direct NEON
+      equivalent — use __builtin_shufflevector or manual lane extract/insert.
+      _mm_blendv* maps to vbslq with mask vector.
+    metadata:
+      match_rules:
+        - pattern: "_mm_shuffle_(epi32|epi8|ps|pd)"
+          type: regex
+          scope: intrinsic_call
+          description: SSE shuffle intrinsics (immediate or variable)
+        - pattern: "_mm_shuffle(lo|hi)_epi16"
+          type: regex
+          scope: intrinsic_call
+          description: SSE 16-bit half shuffles
+        - pattern: "_mm_unpack(lo|hi)_(epi8|epi16|epi32|epi64|ps|pd)"
+          type: regex
+          scope: intrinsic_call
+          description: SSE pack/unpack intrinsics
+        - pattern: "_mm_blend(v)?_(epi16|epi8|ps|pd)"
+          type: regex
+          scope: intrinsic_call
+          description: SSE blend intrinsics (immediate-mask or vector-mask)
+    x64_constructs:
+      - _mm_shuffle_epi32(a, imm8)
+      - _mm_unpacklo_epi8 / _mm_unpackhi_epi32
+      - _mm_blend_epi16(a, b, mask)
+      - _mm_blendv_epi8(a, b, mask)
+      - _mm_blendv_ps(a, b, mask)
+    arm64_constructs:
+      - "__builtin_shufflevector for compile-time shuffles"
+      - "vsetq_lane / vgetq_lane manual sequence for arbitrary shuffles"
+      - vzip1q_s8 / vzip2q_s32 (AArch64) or vzipq_s8 + lo/hi pick (ARMv7)
+      - "vcombine_s64(vget_low_s64(a), vget_low_s64(b)) for unpacklo_epi64"
+      - "vbslq_s8(mask, b, a) for blendv (note operand order: mask, true, false)"
+      - "vbslq_f32(vreinterpretq_u32_f32(mask), b, a) for float blendv"
+    pitfalls:
+      - vbslq operand order is (mask, true_value, false_value) — easy to mix up
+      - Float blendv requires reinterpret of mask to uint32x4_t
+      - Arbitrary _mm_shuffle_epi32 has no single NEON equivalent — fall back to lane-by-lane
+      - vzip1q / vzip2q require AArch64; ARMv7 must use vzipq + half pick
+    validation_criteria:
+      - unpack maps to vzip1q / vzip2q (or vzipq on ARMv7)
+      - blendv maps to vbslq with correct (mask, true, false) operand order
+      - Arbitrary shuffles use __builtin_shufflevector or manual lane sequence
+
+  - id: 8
+    name: conversion-and-cast
+    category: intrinsic-mapping
+    description: >
+      Float↔int conversions map to vcvtq variants. Widening conversions
+      (epi8→epi16→epi32) use vmovl_<type> + vget_low/vget_high. Bitwise casts
+      (castps_si128, castsi128_ps) use vreinterpretq with no instructions emitted.
+    metadata:
+      match_rules:
+        - pattern: "_mm_cvt(t)?(epi32|ps|pd|epi16|epi8|epu8|epu16|epu32)_"
+          type: regex
+          scope: intrinsic_call
+          description: SSE conversion intrinsics (numeric)
+        - pattern: "_mm_cast(si128|ps|pd)_(ps|si128|pd)"
+          type: regex
+          scope: intrinsic_call
+          description: SSE bitcast intrinsics
+    x64_constructs:
+      - _mm_cvtepi32_ps / _mm_cvtps_epi32 / _mm_cvttps_epi32
+      - _mm_cvtepi8_epi16 / _mm_cvtepi16_epi32 / _mm_cvtepi32_epi64
+      - _mm_cvtepu8_epi16 / _mm_cvtepu32_epi64
+      - _mm_castsi128_ps / _mm_castps_si128
+    arm64_constructs:
+      - vcvtq_f32_s32 / vcvtnq_s32_f32 (round) / vcvtq_s32_f32 (truncate)
+      - "vmovl_s8(vget_low_s8(a)) for epi8 → epi16"
+      - "vmovl_s16(vget_low_s16(vmovl_s8(vget_low_s8(a)))) for epi8 → epi32"
+      - vmovl_u8 / vmovl_u16 / vmovl_u32 for unsigned widening
+      - vreinterpretq_f32_s32 / vreinterpretq_s32_f32
+    pitfalls:
+      - _mm_cvtps_epi32 rounds to nearest — use vcvtnq_s32_f32 (AArch64) not vcvtq_s32_f32
+      - _mm_cvttps_epi32 truncates — that one maps to vcvtq_s32_f32
+      - Widening only takes the low half — chain vget_low and vmovl for multi-step widening
+      - Cast intrinsics emit no NEON instructions — they are pure type punning
+    validation_criteria:
+      - Numeric conversions match rounding mode (cvtnq for round, cvtq for truncate)
+      - Widening conversions use vmovl + vget_low chain
+      - Bitcast intrinsics replaced with vreinterpretq
+
+  - id: 9
+    name: horizontal-operations
+    category: horizontal-reduction
+    description: >
+      Horizontal adds map to vpaddq (AArch64) or vpadd half-width (ARMv7).
+      _mm_movemask_epi8 has no direct NEON equivalent — use vmaxvq for
+      any-match boolean, or vshrn nibble-mask + ctzll for position. Sad and
+      hsub require multi-step recipes.
+    metadata:
+      match_rules:
+        - pattern: "_mm_h(add|sub)_(epi16|epi32|ps|pd)"
+          type: regex
+          scope: intrinsic_call
+          description: SSE horizontal add/sub
+        - pattern: "_mm_movemask_(epi8|ps|pd)"
+          type: regex
+          scope: intrinsic_call
+          description: SSE movemask intrinsics
+        - pattern: "_mm_sad_epu8"
+          type: exact
+          scope: intrinsic_call
+          description: Sum of absolute differences for unsigned bytes
+    x64_constructs:
+      - _mm_hadd_epi16 / _mm_hadd_epi32 / _mm_hadd_ps
+      - _mm_hsub_epi16
+      - _mm_movemask_epi8
+      - _mm_movemask_ps
+      - _mm_sad_epu8
+    arm64_constructs:
+      - "vpaddq_s16 / vpaddq_s32 / vpaddq_f32 (AArch64)"
+      - "vpadd_s16 (ARMv7 half-width)"
+      - "vmaxvq_u8(cmp) != 0 for any-match boolean"
+      - "vshrn_n_u16(vreinterpretq_u16_u8(cmp), 4) + __builtin_ctzll / 4 for position"
+      - "vpaddlq_u8 chain for sad_epu8"
+    pitfalls:
+      - vpaddq requires AArch64 — on ARMv7 use vpadd on halves and vcombine
+      - movemask vshrn approach gives 4 bits per byte (nibble mask), NOT 1 bit per byte
+      - Position calculation requires dividing the ctzll result by 4
+      - hsub has no direct equivalent — synthesize with negate + vpaddq
+    validation_criteria:
+      - Horizontal adds use vpaddq (AArch64) or vpadd on halves (ARMv7)
+      - movemask any-match uses vmaxvq, position uses vshrn nibble-mask + ctzll
+      - sad_epu8 uses vpaddlq cascade
+
+  - id: 10
+    name: fma-and-rounding
+    category: intrinsic-mapping
+    description: >
+      Fused multiply-add intrinsics map to vfmaq / vfmsq with a swapped
+      operand order (NEON puts accumulator first). Rounding intrinsics
+      (floor/ceil/round) map to vrndmq / vrndpq / vrndnq on AArch64; on
+      ARMv7 fall back to scalar.
+    metadata:
+      match_rules:
+        - pattern: "_mm_fn?m(add|sub)_(ps|pd)"
+          type: regex
+          scope: intrinsic_call
+          description: SSE/AVX FMA intrinsics
+        - pattern: "_mm_(floor|ceil|round)_(ps|pd)"
+          type: regex
+          scope: intrinsic_call
+          description: SSE rounding intrinsics
+    x64_constructs:
+      - _mm_fmadd_ps(a, b, c)
+      - _mm_fmsub_ps(a, b, c)
+      - _mm_fnmadd_ps(a, b, c)
+      - _mm_floor_ps / _mm_ceil_ps / _mm_round_ps
+    arm64_constructs:
+      - "vfmaq_f32(c, a, b)  # operand order: accumulator first"
+      - "vfmsq_f32(c, a, b)"
+      - "vrndmq_f32 (floor) / vrndpq_f32 (ceil) / vrndnq_f32 (round-to-nearest)"
+    pitfalls:
+      - NEON FMA accumulator is first operand (c, a, b) — SSE FMA is (a, b, c)
+      - vfmaq_f64 requires AArch64
+      - Rounding intrinsics require AArch64 — on ARMv7 fall back to scalar loop
+    validation_criteria:
+      - FMA operand order is (accumulator, multiplicand_a, multiplicand_b)
+      - Rounding intrinsics guarded with defined(__aarch64__) on cross-platform code
+
+  - id: 11
+    name: multistep-recipes
+    category: intrinsic-mapping
+    description: >
+      Some SSE intrinsics have no direct NEON equivalent and require a
+      multi-step sequence: _mm_mulhi_epi16 (vmull + vshrn + vcombine),
+      _mm_madd_epi16 (vmull + vpaddq), and ARMv7 _mm_div_ps (vrecpeq +
+      Newton-Raphson iterations).
+    metadata:
+      match_rules:
+        - pattern: "_mm_mulhi_epi16"
+          type: exact
+          scope: intrinsic_call
+          description: 16-bit multiply, take high 16 bits
+        - pattern: "_mm_madd_epi16"
+          type: exact
+          scope: intrinsic_call
+          description: 16-bit multiply-add with widening
+        - pattern: "_mm_div_ps"
+          type: exact
+          scope: intrinsic_call
+          description: Float divide (no direct ARMv7 equivalent)
+    x64_constructs:
+      - _mm_mulhi_epi16(a, b)
+      - _mm_madd_epi16(a, b)
+      - _mm_div_ps(a, b)  # on ARMv7
+    arm64_constructs:
+      - "mulhi: vmull_s16 + vshrn_n_s32(_, 16) + vcombine_s16"
+      - "madd: vmull_s16 + vpaddq_s32 (AArch64)"
+      - "div on ARMv7: vrecpeq_f32 + 2x vrecpsq_f32 step + vmulq_f32"
+    pitfalls:
+      - mulhi recipe loses precision if high half of input is widened incorrectly — use vmull, not vmulq
+      - madd on ARMv7 must use vpadd_s32 on halves and vcombine — vpaddq_s32 is AArch64-only
+      - Newton-Raphson reciprocal requires two steps for full single-precision accuracy
+    validation_criteria:
+      - mulhi uses vmull → vshrn → vcombine sequence
+      - madd uses vmull → vpaddq (or vpadd + vcombine on ARMv7)
+      - ARMv7 div uses vrecpeq + 2 NR steps before final vmulq

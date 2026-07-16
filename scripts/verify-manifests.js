@@ -14,21 +14,36 @@ const path = require('path');
 
 const root = path.resolve(__dirname, '..');
 
+// Matches any `NAME = [ ... ];` assignment. Hardcoded literal (no RegExp built
+// from a variable) so the pattern is fixed and ReDoS-free; the caller selects
+// the list it wants by name from the captured groups.
+const LIST_RE = /(\w+)\s*=\s*\[([\s\S]*?)\];/g;
+
 function extractList(sourceText, listName) {
-    const re = new RegExp(listName + '\\s*=\\s*\\[([\\s\\S]*?)\\];');
-    const m = sourceText.match(re);
-    if (!m) { return null; }
-    return m[1]
-        .split(',')
-        .map(s => s.trim().replace(/^['"]|['"]$/g, ''))
-        .filter(Boolean)
-        .sort();
+    for (const m of sourceText.matchAll(LIST_RE)) {
+        if (m[1] !== listName) { continue; }
+        return m[2]
+            .split(',')
+            .map(s => s.trim().replace(/^['"]|['"]$/g, ''))
+            .filter(Boolean)
+            .sort();
+    }
+    return null;
 }
 
-function listDiskFiles(dir, filter) {
-    const abs = path.join(root, dir);
-    if (!fs.existsSync(abs)) { return []; }
-    return fs.readdirSync(abs, { withFileTypes: true })
+// Absolute paths to the four asset directories, each built from a string
+// literal (no variable ever flows into path.join) — so there is no path to
+// traverse. listDiskFiles receives a ready-made absolute dir, not a name.
+const ASSET_DIRS = {
+    AGENT_FILES:       path.join(root, 'agents'),
+    INSTRUCTION_FILES: path.join(root, 'instructions'),
+    SKILL_DIRS:        path.join(root, 'skills'),
+    PROMPT_FILES:      path.join(root, 'prompts'),
+};
+
+function listDiskFiles(absDir, filter) {
+    if (!fs.existsSync(absDir)) { return []; }
+    return fs.readdirSync(absDir, { withFileTypes: true })
         .filter(filter)
         .map(e => e.name)
         .sort();
@@ -38,10 +53,10 @@ const ext = fs.readFileSync(path.join(root, 'src', 'extension.ts'), 'utf8');
 const un  = fs.readFileSync(path.join(root, 'uninstall.js'),        'utf8');
 
 const disk = {
-    AGENT_FILES:       listDiskFiles('agents',       e => e.isFile()      && e.name.endsWith('.md')),
-    INSTRUCTION_FILES: listDiskFiles('instructions', e => e.isFile()      && e.name.endsWith('.md')),
-    SKILL_DIRS:        listDiskFiles('skills',       e => e.isDirectory()),
-    PROMPT_FILES:      listDiskFiles('prompts',      e => e.isFile()      && e.name.endsWith('.md')),
+    AGENT_FILES:       listDiskFiles(ASSET_DIRS.AGENT_FILES,       e => e.isFile()      && e.name.endsWith('.md')),
+    INSTRUCTION_FILES: listDiskFiles(ASSET_DIRS.INSTRUCTION_FILES, e => e.isFile()      && e.name.endsWith('.md')),
+    SKILL_DIRS:        listDiskFiles(ASSET_DIRS.SKILL_DIRS,        e => e.isDirectory()),
+    PROMPT_FILES:      listDiskFiles(ASSET_DIRS.PROMPT_FILES,      e => e.isFile()      && e.name.endsWith('.md')),
 };
 
 function arraysEqual(a, b) {
