@@ -1,0 +1,180 @@
+version: "1.0"
+generated_from: skills/intrinsics-x64-to-arm64/references/specs/guard-patterns.md
+description: >
+  Porting patterns for preprocessor guard correctness in x86/ARM64 cross-platform
+  code — covering ARM64EC inclusion, macro tiers, ABI shims, and header guards.
+
+specs:
+  - id: 1
+    name: arm64ec-missing-from-positive-guard
+    category: preprocessor-guard
+    description: >
+      #ifdef _M_ARM64 alone misses ARM64EC. ARM64EC is an ARM64 binary with x64-ABI
+      that uses NEON intrinsics, not SSE/AVX. This is the single most common porting bug.
+    metadata:
+      match_rules:
+        - pattern: "#ifdef\\s+_M_ARM64\\b(?!.*_M_ARM64EC)"
+          type: regex
+          scope: preprocessor
+          description: "#ifdef _M_ARM64 without _M_ARM64EC on the same guard"
+        - pattern: "#if\\s+defined\\s*\\(\\s*_M_ARM64\\s*\\)\\s*$"
+          type: regex
+          scope: preprocessor
+          description: "#if defined(_M_ARM64) alone on a line without || _M_ARM64EC"
+        - pattern: "#if\\s+defined\\s*\\(\\s*_M_ARM64\\s*\\)\\s*(?!\\|\\|)"
+          type: regex
+          scope: preprocessor
+          description: "#if defined(_M_ARM64) not followed by || (missing ARM64EC)"
+    x64_constructs:
+      - "#ifdef _M_ARM64"
+      - "#if defined(_M_ARM64)"
+    arm64_constructs:
+      - "#if defined(_M_ARM64) || defined(_M_ARM64EC)"
+    pitfalls:
+      - ARM64EC incorrectly falls into the #else (x64) path when _M_ARM64EC is omitted
+      - ARM64EC uses NEON intrinsics — giving it the x64 SSE/AVX path will fail to compile or produce wrong results
+    validation_criteria:
+      - No bare #ifdef _M_ARM64 without _M_ARM64EC (unless intentional ABI shim)
+      - All NEON code guarded with #if defined(_M_ARM64) || defined(_M_ARM64EC)
+
+  - id: 2
+    name: arm64ec-missing-from-negative-guard
+    category: preprocessor-guard
+    description: >
+      #ifndef _M_ARM64 alone lets ARM64EC into x64-only code paths.
+      Must use #if !defined(_M_ARM64) && !defined(_M_ARM64EC) to exclude both.
+    metadata:
+      match_rules:
+        - pattern: "#ifndef\\s+_M_ARM64\\b(?!.*_M_ARM64EC)"
+          type: regex
+          scope: preprocessor
+          description: "#ifndef _M_ARM64 without _M_ARM64EC exclusion"
+        - pattern: "#if\\s+!defined\\s*\\(\\s*_M_ARM64\\s*\\)\\s*$"
+          type: regex
+          scope: preprocessor
+          description: "#if !defined(_M_ARM64) alone without && !defined(_M_ARM64EC)"
+    x64_constructs:
+      - "#ifndef _M_ARM64"
+      - "#if !defined(_M_ARM64)"
+    arm64_constructs:
+      - "#if !defined(_M_ARM64) && !defined(_M_ARM64EC)"
+    pitfalls:
+      - ARM64EC incorrectly enters x64-only code paths
+      - Only exception is ABI shim pattern where #ifndef _M_ARM64 is intentional
+    validation_criteria:
+      - No bare #ifndef _M_ARM64 without _M_ARM64EC (unless ABI shim)
+
+  - id: 3
+    name: vectorized-macro-tier-misuse
+    category: preprocessor-guard
+    description: >
+      The _VECTORIZED_* macro tier system gates which algorithms are vectorized per target.
+      Using wrong tier causes ARM64 to miss vectorization or get x64-only code.
+    metadata:
+      match_rules:
+        - pattern: "_VECTORIZED_FOR_X64_X86\\b"
+          type: regex
+          scope: preprocessor
+          description: x64/x86-only tier macro (ARM64 excluded)
+        - pattern: "_VECTORIZED_FOR_X64_X86_ARM64\\b(?!_ARM64EC)"
+          type: regex
+          scope: preprocessor
+          description: Redundant tier without ARM64EC suffix (deprecated after PR #6084)
+    x64_constructs:
+      - "_VECTORIZED_FOR_X64_X86"
+      - "_VECTORIZED_FOR_X64_X86_ARM64"
+    arm64_constructs:
+      - "_VECTORIZED_FOR_X64_X86_ARM64_ARM64EC"
+    pitfalls:
+      - Using _VECTORIZED_FOR_X64_X86 excludes ARM64 from vectorization
+      - _VECTORIZED_FOR_X64_X86_ARM64 is redundant — ARM64 and ARM64EC always have same value
+    validation_criteria:
+      - New vectorized algorithms use _VECTORIZED_FOR_X64_X86_ARM64_ARM64EC tier
+      - No bare _VECTORIZED_FOR_X64_X86_ARM64 without _ARM64EC suffix
+
+  - id: 4
+    name: abi-shim-guard-pattern
+    category: preprocessor-guard
+    description: >
+      Legacy ABI shim functions use #ifndef _M_ARM64 intentionally (without _M_ARM64EC)
+      because pure ARM64 never exported the symbol but ARM64EC did.
+    metadata:
+      match_rules:
+        - pattern: "#ifndef\\s+_M_ARM64\\s*\\n.*TRANSITION.*ABI"
+          type: regex
+          scope: preprocessor
+          description: ABI shim pattern with TRANSITION comment
+        - pattern: "__std_swap_ranges_trivially_swappable\\b(?!_noalias)"
+          type: regex
+          scope: function_call
+          description: Legacy swap_ranges function (ABI shim candidate)
+    x64_constructs:
+      - "#ifndef _M_ARM64 // TRANSITION, ABI"
+    arm64_constructs:
+      - "#ifndef _M_ARM64 // intentional: ARM64EC keeps the export"
+    pitfalls:
+      - Do not add _M_ARM64EC to this guard — ARM64EC NEEDS the shim for binary compat
+      - Only applies to functions that were never exported on pure ARM64
+    validation_criteria:
+      - ABI shim has TRANSITION comment explaining why _M_ARM64EC is omitted
+
+  - id: 5
+    name: isa-enabled-in-arm64-path
+    category: preprocessor-guard
+    description: >
+      __isa_enabled and __ISA_AVAILABLE_* are x64/x86 only. ARM64 must use
+      IsProcessorFeaturePresent for feature detection.
+    metadata:
+      match_rules:
+        - pattern: "__isa_enabled"
+          type: exact
+          scope: expression
+          description: Reference to x64-only ISA detection global
+        - pattern: "__ISA_AVAILABLE_"
+          type: prefix
+          scope: expression
+          description: ISA availability enum constants
+        - pattern: "#include\\s*<isa_availability\\.h>"
+          type: regex
+          scope: preprocessor
+          description: Include of x64-only ISA header
+    x64_constructs:
+      - "__isa_enabled & (1 << __ISA_AVAILABLE_AVX2)"
+      - "#include <isa_availability.h>"
+    arm64_constructs:
+      - "IsProcessorFeaturePresent(PF_ARM_NEON_INSTRUCTIONS_AVAILABLE)"
+    pitfalls:
+      - __isa_enabled does not exist on ARM64 — will cause linker error
+      - ARM64 baseline always has NEON, so most feature checks are unnecessary
+    validation_criteria:
+      - No __isa_enabled or __ISA_AVAILABLE_* in ARM64/ARM64EC code paths
+      - Feature detection uses IsProcessorFeaturePresent on ARM64
+
+  - id: 6
+    name: header-include-mismatch
+    category: preprocessor-guard
+    description: >
+      ARM64 path must include arm64_neon.h + Windows.h; x64 path uses intrin.h +
+      isa_availability.h. Wrong includes cause compile errors.
+    metadata:
+      match_rules:
+        - pattern: "#include\\s*<intrin\\.h>"
+          type: regex
+          scope: preprocessor
+          description: x64 intrinsics header (should not appear in ARM64 path)
+        - pattern: "#include\\s*<arm64_neon\\.h>"
+          type: regex
+          scope: preprocessor
+          description: ARM64 NEON header
+    x64_constructs:
+      - "#include <intrin.h>"
+      - "#include <isa_availability.h>"
+    arm64_constructs:
+      - "#include <arm64_neon.h>"
+      - "#include <Windows.h>"
+    pitfalls:
+      - Including intrin.h on ARM64 may partially work but SSE types are unavailable
+      - arm64_neon.h is ARM64-only, will fail on x64
+    validation_criteria:
+      - ARM64 path includes arm64_neon.h, not intrin.h
+      - x64 path includes intrin.h, not arm64_neon.h

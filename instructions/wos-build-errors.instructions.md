@@ -1,5 +1,6 @@
 ---
 description: "ARM64 build error diagnosis and resolution patterns for Windows. Use when: fixing ARM64 compilation errors, resolving linker errors for ARM64, debugging dumpbin validation failures, troubleshooting ARM64 test failures, resolving platform configuration issues in Visual Studio projects."
+applyTo: "**/{build,build-arm64,out}/**/*.{log,err,txt},**/*.{vcxproj,sln,props,targets},**/CMakeLists.txt,**/CMakeCache.txt"
 ---
 
 # ARM64 Build Error Resolution Reference

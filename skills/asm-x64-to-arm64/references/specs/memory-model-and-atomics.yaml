@@ -1,0 +1,173 @@
+version: "1.0"
+generated_from: skills/asm-x64-to-arm64/references/specs/memory-model-and-atomics.md
+description: >
+  Memory model translation from x64 TSO to arm64 weak ordering: plain
+  load/store ordering, mfence/lfence/sfence → dmb forms, single-access
+  acquire/release via ldar/stlr, and atomic RMW (CAS, fetch-add, exchange)
+  via LSE atomics or LL/SC loops.
+
+specs:
+  - id: 1
+    name: plain-load-store-ordering
+    category: memory-model
+    description: >
+      x64 plain mov has implicit acquire/release under TSO; arm64 ldr/str are
+      weakly ordered. Concurrent code must explicitly choose ldar/stlr or
+      add dmb barriers — defaulting to plain ldr/str silently corrupts
+      contended workloads.
+    metadata:
+      match_rules:
+        - pattern: "\\bmov\\s+\\w+\\s*,\\s*\\["
+          type: regex
+          scope: instruction
+          description: x64 plain memory load (review for required ordering on arm64)
+        - pattern: "\\bmov\\s+\\[\\s*\\w+\\s*\\]\\s*,\\s*\\w+"
+          type: regex
+          scope: instruction
+          description: x64 plain memory store (review for required ordering on arm64)
+    x64_constructs:
+      - "mov rax, [rcx]    ; implicit acquire under TSO"
+      - "mov [rcx], rax    ; implicit release under TSO"
+    arm64_constructs:
+      - "ldar x0, [x1]     ; explicit acquire"
+      - "stlr x0, [x1]     ; explicit release"
+      - "ldr x0, [x1]      ; only when no ordering required"
+    pitfalls:
+      - Defaulting plain mov→ldr/str without reviewing ordering produces a port that works on test but breaks under contention
+    validation_criteria:
+      - Every concurrent access in the original is reviewed for required ordering
+      - Single load/store with acquire/release semantics uses ldar/stlr, not dmb + ldr/str
+
+  - id: 2
+    name: memory-barrier-translation
+    category: memory-model
+    description: >
+      mfence/lfence/sfence translate to dmb ish / dmb ishld / dmb ishst.
+      Inner-shareable domain (ish) is correct for SMP. lfence used as
+      Spectre barrier is csdb, not dmb ishld.
+    metadata:
+      match_rules:
+        - pattern: "\\b(mfence|lfence|sfence)\\b"
+          type: regex
+          scope: instruction
+          description: x64 memory barrier instruction
+        - pattern: "\\bdmb\\s+(sy|st|ld|ish|ishst|ishld)\\b"
+          type: regex
+          scope: instruction
+          description: arm64 dmb barrier
+    x64_constructs:
+      - mfence
+      - lfence
+      - sfence
+    arm64_constructs:
+      - dmb ish
+      - dmb ishld
+      - dmb ishst
+    pitfalls:
+      - Misidentifying lfence as memory-order when it was meant as speculation barrier (or vice versa) leaves either redundant cost or missing protection
+      - For single load/store with acquire/release, prefer ldar/stlr over dmb-wrapped plain access
+    validation_criteria:
+      - Every mfence/lfence/sfence translation is reviewed against the csdb speculation-barrier rule
+      - Single-access acquire/release uses ldar/stlr, not barrier-wrapped plain access
+
+  - id: 3
+    name: compare-and-swap
+    category: atomics
+    description: >
+      x64 lock cmpxchg uses implicit RAX for expected/old; arm64 casal uses
+      three explicit register operands. Inline asm operand constraints must
+      be rewritten — cannot preserve "=a"(rax) implicit form. LL/SC loop
+      (ldaxr+stlxr) is the baseline-ARMv8.0 fallback.
+    metadata:
+      match_rules:
+        - pattern: "\\block\\s+cmpxchg\\b"
+          type: regex
+          scope: instruction
+          description: x64 lock cmpxchg (CAS)
+        - pattern: "\\bcas(a|l|al)?\\b"
+          type: regex
+          scope: instruction
+          description: arm64 LSE compare-and-swap
+        - pattern: "\\bldaxr\\b"
+          type: regex
+          scope: instruction
+          description: arm64 LL/SC load-acquire-exclusive (CAS-loop primitive)
+    x64_constructs:
+      - "mov rax, expected; lock cmpxchg [mem], new_val"
+    arm64_constructs:
+      - "mov x0, expected; casal x0, new_val, [mem]   ; LSE"
+      - "ldaxr x0, [mem]; cmp x0, expected; b.ne fail; stlxr w1, new_val, [mem]; cbnz w1, retry   ; LL/SC"
+    pitfalls:
+      - RAX-implicit form cannot be preserved; inline asm must replace "=a"(rax) with three explicit register-tied operands
+      - LSE casal is ARMv8.1+; check -march/+lse flags or fall back to LL/SC on baseline ARMv8.0
+    validation_criteria:
+      - All lock cmpxchg translate to casal (LSE) or LL/SC loop
+      - Inline-asm operand constraints reflect three explicit register operands, not implicit RAX
+
+  - id: 4
+    name: 128-bit-cas
+    category: atomics
+    description: >
+      x64 lock cmpxchg16b uses RDX:RAX expected and RCX:RBX new. arm64 caspal
+      (LSE) takes a register pair (Xn, Xn+1 consecutive) for each role; LL/SC
+      uses ldxp + stxp.
+    metadata:
+      match_rules:
+        - pattern: "\\block\\s+cmpxchg16b\\b"
+          type: regex
+          scope: instruction
+          description: x64 128-bit lock cmpxchg
+        - pattern: "\\bcasp(a|l|al)?\\b"
+          type: regex
+          scope: instruction
+          description: arm64 LSE 128-bit compare-and-swap pair
+        - pattern: "\\b(ldxp|stxp)\\b"
+          type: regex
+          scope: instruction
+          description: arm64 LL/SC exclusive pair load/store
+    x64_constructs:
+      - "lock cmpxchg16b [mem]"
+    arm64_constructs:
+      - "caspal x0, x1, x2, x3, [mem]"
+    pitfalls:
+      - Register pair operands must be consecutive (Xn, Xn+1); register allocation must respect this
+    validation_criteria:
+      - All lock cmpxchg16b translate to casp[al] or ldxp+stxp loop
+
+  - id: 5
+    name: atomic-add-and-exchange
+    category: atomics
+    description: >
+      lock xadd → ldaddal; xchg [mem],reg → swpal; lock or → ldsetal;
+      lock and → ldclral with COMPLEMENTED mask. Suffixes a/l/al control
+      acquire/release ordering.
+    metadata:
+      match_rules:
+        - pattern: "\\block\\s+(xadd|add|or|and|sub)\\b"
+          type: regex
+          scope: instruction
+          description: x64 lock-prefixed RMW
+        - pattern: "\\bxchg\\s+\\[.*\\]"
+          type: regex
+          scope: instruction
+          description: x64 xchg with memory operand (implicitly locked)
+        - pattern: "\\b(ldadd|ldset|ldclr|ldeor|swp)(a|l|al)?\\b"
+          type: regex
+          scope: instruction
+          description: arm64 LSE atomic RMW
+    x64_constructs:
+      - "lock xadd [mem], rax    ; atomic fetch-add"
+      - "xchg [mem], rax         ; atomic exchange (implicit lock)"
+      - "lock or [mem], rax"
+      - "lock and [mem], rax     ; clear bits = NOT mask"
+    arm64_constructs:
+      - "ldaddal x0, x0, [mem]"
+      - "swpal x0, x0, [mem]"
+      - "ldsetal x0, x0, [mem]"
+      - "ldclral x0, x0, [mem]   ; mask must be COMPLEMENT of x64 AND mask"
+    pitfalls:
+      - lock and translates to ldclral which clears specified bits — operand semantics inverts; arm64 mask must be complement of x64 AND mask
+      - Suffix mismatch (a/l/al) silently changes ordering — match the original semantics
+    validation_criteria:
+      - lock prefixes translate to LSE atomics with appropriate a/l/al suffix
+      - lock and → ldclral with complemented mask

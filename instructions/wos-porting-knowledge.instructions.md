@@ -1,5 +1,6 @@
 ---
 description: "ARM64 porting knowledge reference for Windows. Use when: porting x64 code to ARM64, translating SSE/AVX intrinsics to NEON, understanding Windows ARM64 specifics, ARM64EC considerations."
+applyTo: "**/*.{c,cc,cpp,cxx,cu,h,hh,hpp,hxx,inc,ipp,rs}"
 ---
 
 # ARM64 Porting Knowledge Reference
@@ -43,63 +44,11 @@ Flags to **remove** when building for ARM64:
 - `/arch:SSE`, `/arch:SSE2`, `/arch:AVX`, `/arch:AVX2`, `/arch:AVX-512`
 - `/favor:INTEL64`, `/favor:AMD64`
 
-## SSE → NEON Quick Reference (via sse2neon)
+## SSE / AVX → NEON translation
 
-The sse2neon project (https://github.com/DLTcollab/sse2neon) provides drop-in replacements for SSE/SSE2/SSE3/SSSE3/SSE4.x intrinsics using ARM NEON. When integrated, most SSE code compiles without modification.
+**Policy: no translation-shim libraries** (no `sse2neon.h`, `simde`, `xsimd`, `highway`, etc.). Every NEON instruction must be hand-written from `<arm_neon.h>` / `<arm_acle.h>` (C/C++), `core::arch::aarch64` (Rust), or `System.Runtime.Intrinsics.Arm.*` (.NET).
 
-### What sse2neon Covers
-
-| Intrinsic Family | Header | Covered by sse2neon |
-|---|---|---|
-| SSE (`_mm_*` float) | `xmmintrin.h` | Yes |
-| SSE2 (`_mm_*` double/int) | `emmintrin.h` | Yes |
-| SSE3 | `pmmintrin.h` | Yes |
-| SSSE3 | `tmmintrin.h` | Yes |
-| SSE4.1 | `smmintrin.h` | Yes |
-| SSE4.2 | `nmmintrin.h` | Yes (CRC32, string ops) |
-| AES-NI | `wmmintrin.h` | Partial (via ARM Crypto) |
-| AVX | `immintrin.h` | No |
-| AVX2 | `immintrin.h` | No |
-| AVX-512 | `immintrin.h` | No |
-
-### Manual NEON Equivalents for Common SSE
-
-When sse2neon is not desired, here are direct NEON translations:
-
-| SSE Intrinsic | NEON Equivalent | Notes |
-|---|---|---|
-| `_mm_set1_ps(x)` | `vdupq_n_f32(x)` | Broadcast float |
-| `_mm_setzero_ps()` | `vdupq_n_f32(0)` | Zero vector |
-| `_mm_load_ps(p)` | `vld1q_f32(p)` | Load 4 floats |
-| `_mm_store_ps(p, v)` | `vst1q_f32(p, v)` | Store 4 floats |
-| `_mm_add_ps(a, b)` | `vaddq_f32(a, b)` | Add |
-| `_mm_sub_ps(a, b)` | `vsubq_f32(a, b)` | Subtract |
-| `_mm_mul_ps(a, b)` | `vmulq_f32(a, b)` | Multiply |
-| `_mm_div_ps(a, b)` | `vdivq_f32(a, b)` | Divide (ARMv8 has native div) |
-| `_mm_min_ps(a, b)` | `vminq_f32(a, b)` | Minimum |
-| `_mm_max_ps(a, b)` | `vmaxq_f32(a, b)` | Maximum |
-| `_mm_sqrt_ps(a)` | `vsqrtq_f32(a)` | Square root |
-| `_mm_and_ps(a, b)` | `vreinterpretq_f32_u32(vandq_u32(...))` | Bitwise AND |
-| `_mm_or_ps(a, b)` | `vreinterpretq_f32_u32(vorrq_u32(...))` | Bitwise OR |
-| `_mm_xor_ps(a, b)` | `vreinterpretq_f32_u32(veorq_u32(...))` | Bitwise XOR |
-| `_mm_cmpeq_ps(a, b)` | `vreinterpretq_f32_u32(vceqq_f32(a, b))` | Compare equal |
-| `_mm_cmplt_ps(a, b)` | `vreinterpretq_f32_u32(vcltq_f32(a, b))` | Compare less-than |
-| `_mm_shuffle_ps(a,b,i)` | Complex — use `vextq`, `vzip`, `vuzp`, `vtbl` | Shuffle |
-| `_mm_movemask_ps(a)` | No direct — use `vshrn` + manual bits | Extract sign bits |
-
-### Integer Operations
-
-| SSE2 Intrinsic | NEON Equivalent |
-|---|---|
-| `_mm_set1_epi32(x)` | `vdupq_n_s32(x)` |
-| `_mm_add_epi32(a, b)` | `vaddq_s32(a, b)` |
-| `_mm_sub_epi32(a, b)` | `vsubq_s32(a, b)` |
-| `_mm_mullo_epi32(a, b)` | `vmulq_s32(a, b)` |
-| `_mm_and_si128(a, b)` | `vandq_s32(a, b)` |
-| `_mm_or_si128(a, b)` | `vorrq_s32(a, b)` |
-| `_mm_slli_epi32(a, n)` | `vshlq_n_s32(a, n)` |
-| `_mm_srli_epi32(a, n)` | `vshrq_n_u32(a, n)` |
-| `_mm_cmpeq_epi32(a, b)` | `vceqq_s32(a, b)` |
+For the intrinsic mapping tables (SSE/SSE2 float + integer, Windows ARM64 baseline ISA including AES / SHA1 / SHA2 / PMULL / CRC32, ARMv8.2+ optional features), load the [wos-neon-reference](../skills/wos-neon-reference/SKILL.md) skill on demand.
 
 ## Memory Ordering on ARM64
 
@@ -124,38 +73,27 @@ int val = atomic_load_explicit(&flag, memory_order_acquire);
 
 ## Processor Feature Detection on ARM64 Windows
 
-Replace CPUID-based feature detection with Windows API:
+Replace CPUID-based feature detection with the Windows API. For the full baseline ISA / optional-feature table, see the [wos-neon-reference](../skills/wos-neon-reference/SKILL.md) skill; short form:
 
 ```c
 #include <windows.h>
-
-/* ARM64 feature detection via IsProcessorFeaturePresent() */
-bool has_neon    = IsProcessorFeaturePresent(PF_ARM_NEON_INSTRUCTIONS_AVAILABLE);     /* Always true on ARM64 */
-bool has_crc32   = IsProcessorFeaturePresent(PF_ARM_V8_CRC32_INSTRUCTIONS_AVAILABLE);
-bool has_crypto  = IsProcessorFeaturePresent(PF_ARM_V8_CRYPTO_INSTRUCTIONS_AVAILABLE);
+bool has_neon    = IsProcessorFeaturePresent(PF_ARM_NEON_INSTRUCTIONS_AVAILABLE);     // always true
+bool has_crc32   = IsProcessorFeaturePresent(PF_ARM_V8_CRC32_INSTRUCTIONS_AVAILABLE); // baseline on WoA
+bool has_crypto  = IsProcessorFeaturePresent(PF_ARM_V8_CRYPTO_INSTRUCTIONS_AVAILABLE);// baseline on WoA
 bool has_atomics = IsProcessorFeaturePresent(PF_ARM_V81_ATOMIC_INSTRUCTIONS_AVAILABLE);
-bool has_dp      = IsProcessorFeaturePresent(PF_ARM_V82_DP_INSTRUCTIONS_AVAILABLE);
-bool has_jscvt   = IsProcessorFeaturePresent(PF_ARM_V83_JSCVT_INSTRUCTIONS_AVAILABLE);
-bool has_lrcpc   = IsProcessorFeaturePresent(PF_ARM_V83_LRCPC_INSTRUCTIONS_AVAILABLE);
+bool has_dp      = IsProcessorFeaturePresent(PF_ARM_V82_DP_INSTRUCTIONS_AVAILABLE);   // optional
 ```
 
 ## Common Porting Pitfalls
 
-1. **`_mm_movemask_ps` / `_mm_movemask_epi8`**: No direct NEON equivalent. sse2neon provides an emulation, but it's slower than native x64. Profile if performance-critical.
-
-2. **`_mm_shuffle_ps` with compile-time constant**: NEON shuffle is more restrictive. sse2neon handles it but may be multi-instruction.
-
-3. **Horizontal operations** (`_mm_hadd_ps`, etc.): NEON has `vpaddq` but semantics differ. sse2neon handles it.
-
-4. **`__rdtsc` for timing**: ARM64 has `cntvct_el0` counter but it ticks at a different frequency. Use `QueryPerformanceCounter` for portable high-res timing.
-
-5. **Thread-local storage**: TLS works on ARM64 Windows but internal layout differs. Don't hardcode `gs:` segment register offsets.
-
-6. **Stack alignment**: ARM64 requires 16-byte stack alignment. Most compilers handle this, but hand-written assembly must comply.
-
-7. **Structured Exception Handling**: SEH works on ARM64 but `CONTEXT` structure fields differ (ARM64 has `X0`–`X28`, `Fp`, `Lr`, `Sp`, `Pc` instead of `Rax`, `Rbx`, etc.).
-
-8. **128-bit atomics**: x64 uses `cmpxchg16b`. ARM64 uses `ldxp`/`stxp` pair. Use `_InterlockedCompareExchange128` which works on both.
+1. **`_mm_movemask_ps` / `_mm_movemask_epi8`** — no direct NEON equivalent; hand-code with `vshrn` + manual bit assembly. Profile if performance-critical.
+2. **`_mm_shuffle_ps` with a compile-time constant** — NEON shuffle is more restrictive; expect multi-instruction sequences using `vextq` / `vzip` / `vuzp` / `vtbl`.
+3. **Horizontal ops** (`_mm_hadd_ps`, etc.) — NEON has `vpaddq` but semantics differ.
+4. **`__rdtsc` for timing** — use `QueryPerformanceCounter` for portable high-res timing (ARM64's `cntvct_el0` ticks at a different frequency).
+5. **Thread-local storage** — TLS works on ARM64 Windows but internal layout differs. Don't hardcode `gs:` segment register offsets.
+6. **Stack alignment** — ARM64 requires 16-byte alignment in hand-written assembly.
+7. **Structured Exception Handling** — SEH works on ARM64 but `CONTEXT` fields differ (`X0`–`X28`, `Fp`, `Lr`, `Sp`, `Pc`, not `Rax`/`Rbx`/…).
+8. **128-bit atomics** — use `_InterlockedCompareExchange128` (maps to `cmpxchg16b` on x64, `ldxp`/`stxp` pair on ARM64).
 
 ## ARM64EC (Emulation Compatible)
 
@@ -181,6 +119,8 @@ MSBuild:
 ```
 
 **Note**: ARM64EC is not full native ARM64 — there's a small performance overhead for x64 ↔ ARM64 transitions. Prefer full native ARM64 porting when possible.
+
+**JIT / dynamic code generators on ARM64EC**: if the project JIT-compiles executable code (V8, JSC, Wasm engines, .NET RyuJIT, custom trampolines) and targets ARM64EC, the JIT's page allocation MUST use `VirtualAlloc2` with `MEM_EXTENDED_PARAMETER_EC_CODE` — a plain `VirtualAlloc(..., PAGE_EXECUTE_READWRITE)` allocation is misclassified by the hybrid loader as x64 code and either faults or gets emulated. Load the [jit-arm64ec-virtualalloc-fix-skill](../skills/jit-arm64ec-virtualalloc-fix-skill/SKILL.md) skill when analysing / fixing any `VirtualAlloc*` call site that flows into `WriteProcessMemory`, JIT code caches, or executable heap slabs on an ARM64EC target.
 
 ## vcpkg ARM64 Support
 

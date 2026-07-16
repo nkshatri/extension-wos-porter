@@ -1,0 +1,366 @@
+version: "1.0"
+generated_from: skills/intrinsics-x64-to-arm64/references/arm64-limitations.md
+description: >
+  Porting patterns for ARM64 NEON limitations — operations that have no direct
+  equivalent to common SSE/AVX patterns, with required workarounds.
+
+specs:
+  - id: 1
+    name: no-256-bit-registers
+    category: register-width
+    description: >
+      ARM64 NEON maximum native width is 128-bit. No 256-bit register exists.
+      Use 4x128-bit registers per iteration (64 bytes) to match AVX2 throughput.
+    metadata:
+      match_rules:
+        - pattern: "\\b__m256i\\b"
+          type: regex
+          scope: declaration
+          description: Any use of 256-bit integer register type
+        - pattern: "\\b__m256d?\\b"
+          type: regex
+          scope: declaration
+          description: Any use of 256-bit float register type
+        - pattern: "_mm256_"
+          type: prefix
+          scope: intrinsic_call
+          description: Any AVX2 256-bit intrinsic function call
+    x64_constructs:
+      - __m256i
+      - _mm256_loadu_si256
+      - _mm256_storeu_si256
+    arm64_constructs:
+      - "4 x uint8x16_t (or typed equivalent)"
+      - "vld1q_u8(ptr + 0/16/32/48)"
+      - "vst1q_u8(ptr + 0/16/32/48)"
+    pitfalls:
+      - Do NOT use a single 128-bit register to replace 256-bit — throughput will halve
+      - SVE has variable-width vectors but requires runtime check and different programming model
+    validation_criteria:
+      - ARM64 main loop processes >= 64 bytes per iteration (4 x vld1q_u8)
+      - No __m256i or _mm256_* intrinsics remain in ARM64 code path
+
+  - id: 2
+    name: no-horizontal-64bit-minmax
+    category: horizontal-reduction
+    description: >
+      NEON has vmaxvq/vminvq for u8/u16/u32 but NO vminvq_u64 or vmaxvq_u64.
+      64-bit integer min/max cannot be vectorized with baseline NEON.
+    metadata:
+      match_rules:
+        - pattern: "_mm_min_epi64|_mm_max_epi64|_mm256_min_epi64|_mm256_max_epi64"
+          type: regex
+          scope: intrinsic_call
+          description: 64-bit integer min/max intrinsic calls
+        - pattern: "\\b(int64_t|uint64_t|__int64|unsigned __int64)\\b.*\\b(min|max)\\b"
+          type: regex
+          scope: algorithm_call
+          description: STL min/max algorithms on 64-bit integer types
+        - pattern: "__std_(min|max)_element_8"
+          type: regex
+          scope: function_declaration
+          description: Internal STL 64-bit min/max element functions
+    x64_constructs:
+      - _mm_min_epi64
+      - _mm_max_epi64
+    arm64_constructs:
+      - "Scalar fallback (STL approach)"
+      - "vcgtq_u64 + vbslq_u64 + lane extraction (manual two-step)"
+      - "svminv/svmaxv (SVE, optional)"
+    pitfalls:
+      - Do NOT attempt to synthesize horizontal 64-bit reduction with vminvq_u32 — wrong width
+      - __std_min_element_8 / __std_max_element_8 must be excluded on ARM64/ARM64EC
+    validation_criteria:
+      - 64-bit int min/max functions are guarded with #if !defined(_M_ARM64) && !defined(_M_ARM64EC)
+      - No vminvq_u64 or vmaxvq_u64 calls (they do not exist)
+
+  - id: 3
+    name: no-movemask
+    category: horizontal-reduction
+    description: >
+      No single-instruction equivalent to _mm_movemask_epi8 which extracts MSB
+      of each byte into a 16-bit integer. Two replacement strategies exist.
+    metadata:
+      match_rules:
+        - pattern: "_mm_movemask_epi8"
+          type: exact
+          scope: intrinsic_call
+          description: Direct movemask call extracting byte MSBs
+        - pattern: "_mm256_movemask_epi8"
+          type: exact
+          scope: intrinsic_call
+          description: AVX2 movemask variant
+        - pattern: "_mm_movemask_ps|_mm_movemask_pd"
+          type: regex
+          scope: intrinsic_call
+          description: Float/double movemask variants
+    x64_constructs:
+      - _mm_movemask_epi8
+    arm64_constructs:
+      - "vmaxvq_u8(cmp) != 0 (any-match boolean test)"
+      - "vshrn_n_u16(vreinterpretq_u16_u8(cmp), 4) + __builtin_ctzll / 4 (exact position)"
+    pitfalls:
+      - vmaxvq_u8 only answers "any match?" — cannot find position
+      - vshrn approach produces 4 bits per byte (nibble mask), NOT 1 bit per byte like x64
+      - Position calculation requires dividing ctzll result by 4
+    validation_criteria:
+      - No _mm_movemask_epi8 calls in ARM64 code path
+      - "Any match?" tests use vmaxvq_u8
+      - Position-finding uses vshrn_n_u16 with shift count 4
+
+  - id: 4
+    name: no-masked-load-store
+    category: memory-access
+    description: >
+      Baseline NEON has no masked load/store. AVX2 _mm256_maskload must be
+      replaced with descending-granularity unconditional load cascade.
+    metadata:
+      match_rules:
+        - pattern: "_mm256_mask(load|store)"
+          type: regex
+          scope: intrinsic_call
+          description: AVX2 masked load/store intrinsic calls
+        - pattern: "_Avx2_tail_mask_32"
+          type: exact
+          scope: function_call
+          description: STL internal tail mask generation function
+        - pattern: "_mm_mask(load|store)"
+          type: regex
+          scope: intrinsic_call
+          description: SSE masked load/store variants
+    x64_constructs:
+      - _mm256_maskload_epi32
+      - _mm256_maskstore_epi32
+      - _Avx2_tail_mask_32
+    arm64_constructs:
+      - "if (remaining >= 16) { vld1q_u8 }"
+      - "if (remaining >= 8)  { vld1_u8 }"
+      - "if (remaining >= 4)  { vld1_lane_u32 }"
+      - "while (remaining > 0) { scalar }"
+      - "svld1 (SVE predicated, optional)"
+    pitfalls:
+      - Do NOT attempt to emulate masks with bitwise operations — just use smaller loads
+      - _Avx2_tail_mask_32 must be completely removed, not adapted
+    validation_criteria:
+      - No _Avx2_tail_mask_32 or _mm256_maskload/maskstore in ARM64 code path
+      - Tail handling uses descending-size if-chain (64 → 32 → 16 → 8 → 4 → scalar)
+
+  - id: 5
+    name: no-zeroupper
+    category: construct-removal
+    description: >
+      NEON has no upper-half register contamination. _Zeroupper_on_exit and
+      _mm256_zeroupper() must be removed entirely with no replacement.
+    metadata:
+      match_rules:
+        - pattern: "_Zeroupper_on_exit"
+          type: exact
+          scope: type_or_instance
+          description: RAII guard struct for zeroupper on scope exit
+        - pattern: "_mm256_zeroupper"
+          type: exact
+          scope: intrinsic_call
+          description: Direct zeroupper intrinsic call
+        - pattern: "__vzeroupper"
+          type: exact
+          scope: intrinsic_call
+          description: Compiler builtin zeroupper variant
+    x64_constructs:
+      - _Zeroupper_on_exit
+      - _mm256_zeroupper()
+    arm64_constructs:
+      - "(remove entirely — no replacement needed)"
+    pitfalls:
+      - Do NOT add any "equivalent" cleanup — there is nothing to clean up on ARM64
+      - Do NOT leave the RAII struct defined but empty — remove completely
+    validation_criteria:
+      - No _Zeroupper_on_exit type/instance in ARM64 code path
+      - No _mm256_zeroupper() calls in ARM64 code path
+
+  - id: 6
+    name: no-isa-enabled
+    category: feature-detection
+    description: >
+      ARM64 has no vcruntime __isa_enabled bitmask. Use IsProcessorFeaturePresent
+      for optional features. Baseline NEON needs no runtime check.
+    metadata:
+      match_rules:
+        - pattern: "__isa_enabled"
+          type: exact
+          scope: variable_reference
+          description: Reference to the vcruntime ISA bitmask global
+        - pattern: "__ISA_AVAILABLE_"
+          type: prefix
+          scope: constant_reference
+          description: ISA availability enum constants (AVX2, SSE42, etc.)
+        - pattern: "#include\\s*<isa_availability\\.h>"
+          type: regex
+          scope: preprocessor
+          description: Include of isa_availability header
+        - pattern: "_Use_(avx2|sse42|sse2)\\(\\)"
+          type: regex
+          scope: function_call
+          description: ISA tier check wrapper functions
+    x64_constructs:
+      - "extern \"C\" long __isa_enabled"
+      - "__isa_enabled & (1 << __ISA_AVAILABLE_AVX2)"
+      - "__isa_enabled & (1 << __ISA_AVAILABLE_SSE42)"
+      - "#include <isa_availability.h>"
+    arm64_constructs:
+      - "IsProcessorFeaturePresent(PF_ARM_V82_DP_INSTRUCTIONS_AVAILABLE)"
+      - "IsProcessorFeaturePresent(PF_ARM_SVE_INSTRUCTIONS_AVAILABLE)"
+      - "IsProcessorFeaturePresent(PF_ARM_SVE2_INSTRUCTIONS_AVAILABLE)"
+      - "(baseline NEON: no runtime check needed)"
+    pitfalls:
+      - __isa_enabled cannot be patched for test-time feature disablement on ARM64
+      - Tests must run on hardware lacking the feature or use compile-time #if
+      - Do NOT reference __isa_enabled in ARM64 code — it does not exist there
+    validation_criteria:
+      - No __isa_enabled references in ARM64/ARM64EC code path
+      - No #include <isa_availability.h> in ARM64 code path
+      - Optional features (SVE/SVE2/DotProd) use IsProcessorFeaturePresent
+
+  - id: 7
+    name: no-gather-scatter
+    category: memory-access
+    description: >
+      Baseline NEON has no gather/scatter instructions. Must use scalar loads
+      into vector lanes. SVE2 adds gather/scatter support.
+    metadata:
+      match_rules:
+        - pattern: "_mm256_i32gather_"
+          type: prefix
+          scope: intrinsic_call
+          description: AVX2 32-bit index gather intrinsics
+        - pattern: "_mm256_i64gather_"
+          type: prefix
+          scope: intrinsic_call
+          description: AVX2 64-bit index gather intrinsics
+        - pattern: "_mm_i32gather_|_mm_i64gather_"
+          type: regex
+          scope: intrinsic_call
+          description: SSE 128-bit gather intrinsics
+    x64_constructs:
+      - _mm256_i32gather_epi32
+    arm64_constructs:
+      - "vsetq_lane_u32(ptr[idx[0]], v, 0)"
+      - "vsetq_lane_u32(ptr[idx[1]], v, 1)"
+      - "vsetq_lane_u32(ptr[idx[2]], v, 2)"
+      - "vsetq_lane_u32(ptr[idx[3]], v, 3)"
+      - "SVE2 gather loads (optional)"
+    pitfalls:
+      - Scalar lane insertion is slower than x64 gather — profile before vectorizing
+      - Do NOT attempt to synthesize gather with multiple vld1q — wrong semantics
+    validation_criteria:
+      - No _mm256_i32gather_* in ARM64 code path
+      - Gather patterns use vsetq_lane_u32 or SVE2 gather loads
+
+  - id: 8
+    name: variable-count-shifts
+    category: shift-semantics
+    description: >
+      NEON uses a vector-of-counts approach for variable shifts. Positive count = left,
+      negative count = right. The count must be broadcast to a vector.
+    metadata:
+      match_rules:
+        - pattern: "_mm_sll_epi(16|32|64)\\b"
+          type: regex
+          scope: intrinsic_call
+          description: Variable-count left shift (count in XMM register)
+        - pattern: "_mm_srl_epi(16|32|64)\\b"
+          type: regex
+          scope: intrinsic_call
+          description: Variable-count logical right shift (count in XMM register)
+        - pattern: "_mm_sra_epi(16|32)\\b"
+          type: regex
+          scope: intrinsic_call
+          description: Variable-count arithmetic right shift (count in XMM register)
+        - pattern: "_mm_cvtsi32_si128\\(.*\\).*_mm_s[lr][la]_"
+          type: regex
+          scope: expression
+          description: Pattern of converting scalar to XMM for use as shift count
+    x64_constructs:
+      - "_mm_sll_epi32(a, _mm_cvtsi32_si128(n))"
+      - "_mm_srl_epi32(a, _mm_cvtsi32_si128(n))"
+    arm64_constructs:
+      - "vshlq_s32(vreinterpretq_s32_u32(data), vdupq_n_s32(n)) (left shift)"
+      - "vshlq_s32(vreinterpretq_s32_u32(data), vdupq_n_s32(-n)) (right shift)"
+    pitfalls:
+      - NEON vshlq with negative count is right shift — do NOT use vshrq for variable counts
+      - For compile-time constant shifts, use vshlq_n_u32 (more efficient than variable form)
+      - x64 uses low 64 bits of XMM as count; NEON broadcasts count to every lane
+    validation_criteria:
+      - Variable shifts use vshlq with vdupq_n_s32 (positive for left, negative for right)
+      - Immediate shifts use vshlq_n / vshrq_n variants
+
+  - id: 9
+    name: cross-128bit-lane-ops
+    category: register-width
+    description: >
+      AVX2 cross-lane operations (permute across 128-bit boundaries) have no
+      direct NEON equivalent since NEON is always 128-bit.
+    metadata:
+      match_rules:
+        - pattern: "_mm256_permute2x128_si256"
+          type: exact
+          scope: intrinsic_call
+          description: Cross-128-bit-lane permute of two 256-bit registers
+        - pattern: "_mm256_permutevar8x32_"
+          type: prefix
+          scope: intrinsic_call
+          description: Variable cross-lane 32-bit permute within 256-bit register
+        - pattern: "_mm256_permute4x64_"
+          type: prefix
+          scope: intrinsic_call
+          description: 64-bit element cross-lane permute within 256-bit register
+        - pattern: "_mm256_shuffle_epi8"
+          type: exact
+          scope: intrinsic_call
+          description: AVX2 byte shuffle (operates within 128-bit lanes, but often used in cross-lane patterns)
+    x64_constructs:
+      - _mm256_permute2x128_si256
+      - _mm256_permutevar8x32_epi32
+    arm64_constructs:
+      - "Operate on separate 128-bit halves independently"
+      - "Use vextq_u8 for adjacent-lane extraction within 128 bits"
+      - "Restructure algorithm to avoid cross-lane dependency"
+    pitfalls:
+      - Do NOT try to emulate 256-bit permute with two 128-bit ops blindly — rethink the algorithm
+      - Many AVX2 cross-lane patterns exist only because AVX2 is 256-bit; with 128-bit NEON the problem often disappears
+    validation_criteria:
+      - No _mm256_permute* in ARM64 code path
+      - Algorithm restructured to work within 128-bit lane boundaries
+
+  - id: 10
+    name: 4-byte-tail-ub-trap
+    category: memory-access
+    description: >
+      Direct *(uint32_t*)ptr dereference is UB for non-4-byte-aligned pointers on ARM64.
+      Must use NEON lane intrinsic for safe unaligned 4-byte access.
+    metadata:
+      match_rules:
+        - pattern: "\\*\\s*(static_cast\\s*<\\s*(uint32_t|int32_t|unsigned)\\s*\\*\\s*>|\\(\\s*(uint32_t|int32_t|unsigned)\\s*\\*\\s*\\))"
+          type: regex
+          scope: expression
+          description: Direct dereference of pointer cast to 32-bit type
+        - pattern: "\\*reinterpret_cast\\s*<\\s*(uint32_t|int32_t)\\s*\\*\\s*>"
+          type: regex
+          scope: expression
+          description: Dereference via reinterpret_cast to 32-bit pointer
+        - pattern: "memcpy\\s*\\(.*,\\s*.*,\\s*4\\s*\\)"
+          type: regex
+          scope: function_call
+          description: 4-byte memcpy in tail handling code (acceptable on x64, needs review for ARM64)
+    x64_constructs:
+      - "*(uint32_t*)ptr (direct cast dereference)"
+      - "memcpy(&val, ptr, 4) (acceptable on x64)"
+    arm64_constructs:
+      - "vld1_lane_u32(static_cast<uint32_t*>(ptr), vdup_n_u32(0), 0)"
+      - "vst1_lane_u32(static_cast<uint32_t*>(ptr), v, 0)"
+    pitfalls:
+      - This bug is subtle — x64 code often works despite UB because x64 handles unaligned access in hardware
+      - The STL consistently uses vld1_lane_u32 / vst1_lane_u32 for all 4-byte tails
+      - Do NOT use direct pointer cast even if it "seems to work" — it is UB
+    validation_criteria:
+      - No direct *(uint32_t*) dereference of potentially unaligned pointers in ARM64 tail code
+      - 4-byte tail operations use vld1_lane_u32 / vst1_lane_u32

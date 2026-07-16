@@ -1,5 +1,5 @@
 ---
-description: "Analyze a cloned repository for Windows ARM64 support. Use when: scanning for x64-specific code, detecting build systems, checking ARM64 readiness, auditing SIMD intrinsics, finding inline assembly, reviewing CI/CD configs for ARM64 builds."
+description: "Read-only scan of a repo for Windows ARM64 readiness: build systems, SIMD/asm usage, arch guards, x64-only dependencies, CI config."
 tools: [read, search]
 user-invocable: false
 ---
@@ -85,6 +85,16 @@ If comprehensive ARM64 support already exists, report it clearly.
 
 ### Step 3: Find x64-Specific Code
 
+**Downstream skill routing** — when reporting a finding under 3a / 3b / 3d, name the downstream skill `wos-code-porter` / `wos-optimizer` should load to fix it:
+
+| Finding | Downstream skill |
+|---|---|
+| `_mm_*` / `__m128i` / SSE/AVX intrinsic use | [sse-avx-to-neon](../skills/sse-avx-to-neon/SKILL.md) + [intrinsics-x64-to-arm64](../skills/intrinsics-x64-to-arm64/SKILL.md) |
+| Standalone MASM `.asm` file with `PROC/ENDP/mov rax,...` | [asm-x64-to-arm64](../skills/asm-x64-to-arm64/SKILL.md) |
+| Existing ARM64 `asm volatile(...)` block (needs MSVC intrinsics) | [arm64-inlineasm-to-intrinsics](../skills/arm64-inlineasm-to-intrinsics/SKILL.md) |
+| Any freeform ARM64 code path with no better match | [arm64-baseline-porting](../skills/arm64-baseline-porting/SKILL.md) |
+| `VirtualAlloc` / JIT executable-page allocation on ARM64EC | [jit-arm64ec-virtualalloc-fix-skill](../skills/jit-arm64ec-virtualalloc-fix-skill/SKILL.md) |
+
 #### 3a. SIMD Intrinsics
 
 Search for SSE/AVX/AVX-512 usage (regex patterns):
@@ -156,20 +166,82 @@ Check these files for dependencies:
 #### 4b. Pre-built Binaries
 
 Search for:
-- `.dll`, `.lib`, `.a`, `.so` files committed to the repo
+- `.dll`, `.lib`, `.a`, `.so` files committed to the repo — for every hit, run `dumpbin /HEADERS <file> | Select-String 'machine \('` and record the machine type (`AA64`, `8664`, `14C`, `1C0`). ARM64 binaries already shipped are fine; `8664` / `14C` are blocking unless a matching `AA64` sibling exists in `arm64/` or `runtimes/win-arm64/`.
 - Hardcoded library paths containing `x64`, `amd64`, `x86_64`
-- Download scripts that pull x64-specific binaries
+- Download scripts that pull x64-specific binaries — mark as blocking (URL points at an arch-specific artifact)
 
-Flag these as **blocking issues** — pre-built x64 binaries cannot be ported, they must be replaced with ARM64 equivalents or built from source.
+Flag `8664`/`14C` prebuilts as **blocking issues** — they must be replaced with ARM64 equivalents, built from source, or (last resort) run under emulation with a documented ARM64EC transition plan.
+
+#### 4c. Kernel-mode / driver code (Arm AppReady blocker class)
+
+Search for kernel-mode code. Windows on Arm has stricter driver signing than x64 and no kernel-mode emulation — every hit here is a **hard blocker** for a pure ARM64 port and must be escalated to [Microsoft App Assure](https://learn.microsoft.com/en-us/microsoft-365/business/app-assure).
+
+Markers to search:
+- `*.sys` binaries committed to the repo
+- `*.inf` files — flag any `[Manufacturer]` targeting `NTx86` or `NTamd64` without an `NTarm64` counterpart
+- `KMDF_VERSION_MAJOR`, `WDF_DRIVER_CONFIG`, `DriverEntry`, `IoCreateDevice`, `WdfDeviceCreate`, `NdisMRegisterMiniportDriver`
+- `*.wdk`, `.vcxproj` with `<ConfigurationType>Driver</ConfigurationType>` or referencing `Windows Kernel Mode Driver Framework` targets
+- User-mode drivers using UMDF are portable, but `IWDFDriverCreate` and similar UMDF calls should still be listed for review
+- Hypervisor / VBS / HVCI-adjacent code: `SetupHypercallPage`, `_HV_HYPERVISOR_INTERFACE`, `VMCall`
+
+For each hit, record: file path, driver framework (KMDF / WDM / NDIS / UMDF / hypervisor), whether an ARM64 `.inf` section exists, and one-line recommendation (`escalate to App Assure`, `port UMDF only`, `drop feature on ARM64`, etc.).
+
+#### 4d. Windows on Arm Ecosystem Dashboard classification
+
+Load the [wos-woa-dashboard](../skills/wos-woa-dashboard/SKILL.md) skill and classify every dependency found in 4a into one of four dashboard states (**native / building / unsupported / unknown**) plus one of three runtime states (**ARM64 native / Emulated x64 / Blocking**). Use the skill's curated known-status list first; probe manifest metadata (`vcpkg search`, `npm view <pkg> os cpu`, `pip download --platform win_arm64`, crates.io platform list) only for packages not in the list. Emit the dashboard table exactly as the skill's "Output format" section prescribes.
+
+#### 4e. JIT / dynamic-code allocation (ARM64EC blocker class)
+
+If the project JIT-compiles native code — search for these markers first:
+
+```regex
+VirtualAlloc\s*\(|VirtualAllocEx\s*\(|VirtualAlloc2\s*\(|VirtualAlloc2FromApp\s*\(|MEM_EXTENDED_PARAMETER_EC_CODE|WriteProcessMemory\s*\(|FlushInstructionCache\s*\(|MakeExecutable|SetExecutable|mprotect.*PROT_EXEC|JITCodeCache|JITCodeAllocator|CodeHeap|CodeAllocator|Assembler::alloc|RuntimeCodeAllocator
+```
+
+Common projects that hit this: V8, JavaScriptCore, SpiderMonkey, ChakraCore, WasmEdge, Wasmer, Wasmtime, LuaJIT, PyPy, .NET RyuJIT, Hermes, dnSpy trampolines, custom scripting engines.
+
+For each hit, record: file, line, allocator function, whether the allocation is for JIT-emitted native code, and whether the code targets ARM64 or ARM64EC. If the target is ARM64EC and the allocator is plain `VirtualAlloc(..., PAGE_EXECUTE_READWRITE)` (i.e. missing `VirtualAlloc2` + `MEM_EXTENDED_PARAMETER_EC_CODE`), flag as a **Blocking** issue — the hybrid loader will misclassify the pages as emulated x64. Recommend loading [jit-arm64ec-virtualalloc-fix-skill](../skills/jit-arm64ec-virtualalloc-fix-skill/SKILL.md) in the downstream port to `wos-code-porter`.
 
 ### Step 5: Compiler/Platform-Specific Code
 
 Search for:
-- Windows version checks: `IsWow64Process2`, `GetNativeSystemInfo` (may need updates for ARM64 awareness)
+- Windows version checks: `IsWow64Process` (deprecated on ARM64 Windows — returns misleading results), `IsWow64Process2` (correct), `GetNativeSystemInfo` — flag any comparison against a hardcoded `PROCESSOR_ARCHITECTURE_AMD64` / `PROCESSOR_ARCHITECTURE_INTEL` without a matching `PROCESSOR_ARCHITECTURE_ARM64` branch as an **Arm AppReady "hardcoded architecture check" focus pattern**.
 - Hardcoded page sizes (4096 on x64, 4096 on ARM64 Windows but 16384 on ARM64 Linux — relevant for cross-platform code)
 - Hardcoded cache line sizes (64 bytes on x64, typically 64 on ARM64 but varies)
 - Thread-local storage patterns that assume x64 ABI layout
-- Exception handling: SEH (`__try`/`__except`) works on ARM64, but custom exception filter code may assume x64 context structures
+- Exception handling: SEH (`__try`/`__except`) works on ARM64, but custom exception filter code may assume x64 `CONTEXT` fields (`Rax`/`Rbx`/`Rip`) instead of ARM64 `X0..X28`/`Fp`/`Lr`/`Sp`/`Pc`
+
+### Step 5a: Hardcoded architecture checks (Arm AppReady focus pattern)
+
+Search for arch strings that assume x64 across all languages:
+
+```regex
+# C/C++/Rust — arch identity assertions
+"amd64"|"x86_64"|"x64"|"AMD64"
+# .NET — RuntimeInformation.ProcessArchitecture comparisons
+Architecture\.X64|RuntimeInformation\.ProcessArchitecture\s*==\s*Architecture\.X64
+# Go — runtime.GOARCH comparisons
+runtime\.GOARCH\s*==\s*"amd64"
+# Rust — cfg checks
+#\[cfg\(target_arch\s*=\s*"x86_64"\)\]
+# Node — process.arch checks
+process\.arch\s*[!=]==?\s*["']x64["']
+# Python — platform.machine() checks
+platform\.machine\(\)\s*[!=]==?\s*["'](AMD64|x86_64)["']
+# CMake / Meson / Cargo build cfg without ARM64 arm
+CMAKE_SIZEOF_VOID_P.*8.*(?!aarch64|ARM64)
+```
+
+For each hit, record: file, line, current check, whether an ARM64 branch exists, and severity (a single check that skips a whole ARM64 feature = HIGH; a check that only forks a fast path = MEDIUM).
+
+### Step 5b: CI / build matrix arch checks
+
+Search CI configs for x64-only matrix entries missing an ARM64 sibling:
+- GitHub Actions: `runs-on: windows-latest` or `runs-on: windows-2022` without a `windows-11-arm` matrix entry
+- AppVeyor: `platform: x64` without `platform: ARM64`
+- Azure Pipelines / GitLab / CircleCI: same pattern per their syntax
+
+Record each x64 CI job that lacks an ARM64 counterpart. The [wos-ci-arm64](../instructions/wos-ci-arm64.instructions.md) recipe file has drop-in matrix snippets `wos-build-porter` will use to fill the gap.
 
 ## Output Format
 
@@ -210,11 +282,33 @@ Return a structured report with this exact format:
 #### Package Dependencies Needing ARM64 Verification
 <Table: Dependency | Source | ARM64 Available?>
 
+#### Windows on Arm Dashboard Classification
+<Table: Dependency | Version | Manager | Dashboard status (native/building/unsupported/unknown) | Runtime class (ARM64 native/Emulated x64/Blocking) | Citation>
+(populated using the wos-woa-dashboard skill lookup workflow)
+
 #### Blocking: Pre-built x64 Binaries
-<Table: File/Path | Type | Resolution Needed>
+<Table: File/Path | dumpbin machine type | Resolution Needed>
+
+#### Blocking: Kernel-mode / driver code
+<Table: File | Framework (KMDF/WDM/NDIS/UMDF/hypervisor) | ARM64 .inf branch present? | Recommendation>
+(empty is expected for user-mode apps — a non-empty table means escalate to Microsoft App Assure)
+
+#### Blocking: ARM64EC JIT executable-page allocation
+<Table: File | Line | Allocator (VirtualAlloc / VirtualAlloc2 / mprotect / …) | Uses MEM_EXTENDED_PARAMETER_EC_CODE? | Target (ARM64 / ARM64EC / both) | Recommendation>
+(empty is expected for non-JIT projects — a non-empty table with "No" in the EC-CODE column means the port MUST apply jit-arm64ec-virtualalloc-fix-skill)
+
+### Hardcoded Architecture Checks
+<Table: File | Line | Language | Current Check | ARM64 Branch Present? | Severity (HIGH/MEDIUM)>
 
 ### CI/CD
-<Current CI state and what needs to change for ARM64>
+<Current CI state, list of x64-only jobs missing an ARM64 sibling — the wos-ci-arm64 recipe file has drop-in matrix snippets>
+
+### Arm AppReady Assessment Summary
+- **Target profile recommendation**: <ARM64-native | ARM64EC-hybrid — cite the blockers driving ARM64EC>
+- **Dependency classification totals**: native <N> · building <N> · unsupported <N> · unknown <N>
+- **Runtime class totals**: ARM64 native <N> · Emulated x64 <N> · Blocking <N>
+- **Kernel-mode components**: <count, or "None">
+- **App Assure escalation needed**: <Yes — list blockers | No>
 
 ### Recommendations
 1. <Ordered list of porting steps by priority>

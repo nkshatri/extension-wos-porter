@@ -3,8 +3,8 @@
 
 // Runs via the package.json "vscode:uninstall" lifecycle hook when the
 // extension is fully uninstalled. It executes as a plain Node process with
-// NO access to the `vscode` API, so cleanup uses fs/path only. This mirrors
-// getTargetDir() + AGENT_FILES in src/extension.ts — keep the list in sync.
+// NO access to the `vscode` API, so cleanup uses fs/path only. Keep the four
+// asset lists here in sync with src/extension.ts.
 
 const fs = require('fs');
 const path = require('path');
@@ -19,40 +19,75 @@ const AGENT_FILES = [
     'wos-optimizer.agent.md',
 ];
 
-function getTargetDir() {
+const INSTRUCTION_FILES = [
+    'wos-build-errors.instructions.md',
+    'wos-porting-knowledge.instructions.md',
+    'wos-build-recipes-cmake.instructions.md',
+    'wos-build-recipes-msbuild.instructions.md',
+    'wos-build-recipes-cargo.instructions.md',
+    'wos-build-recipes-meson.instructions.md',
+    'wos-build-recipes-nodegyp.instructions.md',
+    'wos-build-recipes-python.instructions.md',
+    'wos-build-recipes-misc.instructions.md',
+    'wos-ci-arm64.instructions.md',
+];
+
+const SKILL_DIRS = [
+    'wos-neon-reference',
+    'wos-build-error-recipes',
+    'wos-forbidden-skip-reasons',
+    'wos-toolchain-discovery',
+    'wos-woa-dashboard',
+    'arm64-baseline-porting',
+    'arm64-inlineasm-to-intrinsics',
+    'asm-x64-to-arm64',
+    'intrinsics-x64-to-arm64',
+    'jit-arm64ec-virtualalloc-fix-skill',
+    'sse-avx-to-neon',
+];
+
+const PROMPT_FILES = [
+    'wos-verify-port.prompt.md',
+];
+
+function copilotHome() {
     const home = process.env.USERPROFILE || process.env.HOME || '';
-    return path.join(home, '.copilot', 'agents');
+    return path.join(home, '.copilot');
 }
 
-// Sanitize to a bare basename before joining (mirrors agentPath in extension.ts).
-function agentPath(baseDir, file) {
-    return path.join(baseDir, path.basename(file));
+function safeJoin(baseDir, name) {
+    return path.join(baseDir, path.basename(name));
+}
+
+function tryUnlink(p) {
+    try { if (fs.existsSync(p)) { fs.unlinkSync(p); } }
+    catch (err) { console.error(`WoS Porter uninstall: failed to remove ${p}: ${err.message}`); }
+}
+
+function tryRmDirRecursive(p) {
+    try { if (fs.existsSync(p)) { fs.rmSync(p, { recursive: true, force: true }); } }
+    catch (err) { console.error(`WoS Porter uninstall: failed to remove ${p}: ${err.message}`); }
+}
+
+function tryRmEmptyDir(p) {
+    try { if (fs.existsSync(p) && fs.readdirSync(p).length === 0) { fs.rmdirSync(p); } }
+    catch { /* non-fatal — leave in place */ }
 }
 
 try {
-    const targetDir = getTargetDir();
+    const home = copilotHome();
+    const agentsDst       = path.join(home, 'agents');
+    const instructionsDst = path.join(home, 'instructions');
+    const skillsDst       = path.join(home, 'skills');
+    const promptsDst      = path.join(home, 'prompts');
 
-    for (const file of AGENT_FILES) {
-        const filePath = agentPath(targetDir, file);
-        try {
-            if (fs.existsSync(filePath)) {
-                fs.unlinkSync(filePath);
-            }
-        } catch (err) {
-            // Best-effort: keep removing the rest even if one file fails.
-            console.error(`WoS Porter uninstall: failed to remove ${filePath}: ${err.message}`);
-        }
-    }
+    for (const f of AGENT_FILES)       { tryUnlink(safeJoin(agentsDst, f)); }
+    for (const f of INSTRUCTION_FILES) { tryUnlink(safeJoin(instructionsDst, f)); }
+    for (const d of SKILL_DIRS)        { tryRmDirRecursive(safeJoin(skillsDst, d)); }
+    for (const f of PROMPT_FILES)      { tryUnlink(safeJoin(promptsDst, f)); }
 
-    // Remove the agents directory only if our cleanup left it empty, so we
-    // don't delete agents owned by other tools/extensions.
-    try {
-        if (fs.existsSync(targetDir) && fs.readdirSync(targetDir).length === 0) {
-            fs.rmdirSync(targetDir);
-        }
-    } catch {
-        // Non-fatal — leave the directory in place.
-    }
+    // Best-effort removal of empty parent directories only.
+    for (const d of [agentsDst, instructionsDst, skillsDst, promptsDst]) { tryRmEmptyDir(d); }
 } catch (err) {
     console.error(`WoS Porter uninstall: ${err && err.message ? err.message : err}`);
 }

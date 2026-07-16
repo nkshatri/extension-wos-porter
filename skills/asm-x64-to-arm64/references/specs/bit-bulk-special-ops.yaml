@@ -1,0 +1,286 @@
+version: "1.0"
+generated_from: skills/asm-x64-to-arm64/references/specs/bit-bulk-special-ops.md
+description: >
+  Translation rules for instructions outside basic arithmetic/branch/memory:
+  bit scan/count, bit test, shift-double, byte swap, REP/string operations,
+  cache management, prefetching, timestamp counters, pause, and CPUID feature
+  detection.
+
+specs:
+  - id: 1
+    name: bit-scan-and-count
+    category: bit-manipulation
+    description: >
+      bsr/bsf/popcnt/lzcnt/tzcnt translate to clz / rbit+clz combinations.
+      Watch zero-input UB difference: x64 bsr/bsf are undefined for src=0;
+      arm64 clz returns register width.
+    metadata:
+      match_rules:
+        - pattern: "\\b(bsr|bsf|popcnt|lzcnt|tzcnt)\\b"
+          type: regex
+          scope: instruction
+          description: x64 bit scan/count instruction
+        - pattern: "\\b(clz|rbit)\\b"
+          type: regex
+          scope: instruction
+          description: arm64 bit-count primitive
+    x64_constructs:
+      - "bsr rax, rbx"
+      - "bsf rax, rbx"
+      - "popcnt rax, rbx"
+      - "lzcnt rax, rbx"
+    arm64_constructs:
+      - "clz x0, x1; eor x0, x0, #63"
+      - "rbit x0, x1; clz x0, x0"
+      - "fmov d0, x1; cnt v0.8b, v0.8b; addv b0, v0.8b; fmov x0, d0"
+      - "clz x0, x1"
+    pitfalls:
+      - x64 bsr/bsf are UB for src=0 (ZF=1); arm64 clz returns register width — better defined, but if surrounding code reads ZF the branch must be rewritten as cbz before the clz
+      - popcnt requires NEON detour; cheaper to call __builtin_popcountll
+    validation_criteria:
+      - All bsr/bsf translations check whether original code relied on zero-input UB or ZF check
+      - popcnt translations use the NEON sequence or invoke a builtin
+
+  - id: 2
+    name: bit-test-instructions
+    category: bit-manipulation
+    description: >
+      bt+jc pattern collapses to tbnz/tbz. bts/btr/btc become orr/and/eor with
+      immediate masks. Variable-position bt requires lsr+and triplet.
+    metadata:
+      match_rules:
+        - pattern: "\\b(bt|bts|btr|btc)\\b"
+          type: regex
+          scope: instruction
+          description: x64 bit-test family instruction
+        - pattern: "\\b(tbz|tbnz)\\b"
+          type: regex
+          scope: instruction
+          description: arm64 test-bit-and-branch
+    x64_constructs:
+      - "bt rax, 5; jc .L"
+      - "bts rax, 5"
+      - "btr rax, 5"
+      - "btc rax, 5"
+    arm64_constructs:
+      - "tbnz x0, #5, .L"
+      - "orr x0, x0, #(1<<5)"
+      - "and x0, x0, #~(1<<5)"
+      - "eor x0, x0, #(1<<5)"
+    pitfalls:
+      - tbz/tbnz branch range is small (±32 KB) compared to b.<cc> (±1 MB) — long-range targets need tst+b.<cc>
+    validation_criteria:
+      - bt + j<cc> patterns prefer tbz/tbnz when target is in range
+      - bts/btr/btc translations use immediate-mask orr/and/eor
+
+  - id: 3
+    name: shift-double
+    category: bit-manipulation
+    description: >
+      shrd/shld immediate-count form translates to extr. Variable-count needs
+      lsr+lsl+orr triplet with an explicit count=0 guard (lsl by 64 is UB).
+    metadata:
+      match_rules:
+        - pattern: "\\b(shrd|shld)\\b"
+          type: regex
+          scope: instruction
+          description: x64 shift-double instruction
+        - pattern: "\\bextr\\b"
+          type: regex
+          scope: instruction
+          description: arm64 extract (shift-double immediate)
+    x64_constructs:
+      - "shrd rax, rdx, #8       ; immediate count"
+      - "shrd rax, rdx, cl       ; variable count"
+    arm64_constructs:
+      - "extr x0, x1, x0, #8"
+      - "lsr x2, x0, x4; neg w5, w4; lsl x3, x1, x5; orr x0, x2, x3   ; with count=0 guard"
+    pitfalls:
+      - Variable-count translation needs count=0 guard — lsl by 64 is undefined
+    validation_criteria:
+      - Immediate-count shrd/shld translations use extr
+      - Variable-count translations include count=0 guard
+
+  - id: 4
+    name: byte-swap
+    category: bit-manipulation
+    description: >
+      bswap translates to rev (64-bit) or rev w0,w0 (32-bit). movbe (load+swap
+      or swap+store) decomposes into separate ldr/rev or rev/str. No
+      combined load+swap on arm64.
+    metadata:
+      match_rules:
+        - pattern: "\\b(bswap|movbe)\\b"
+          type: regex
+          scope: instruction
+          description: x64 byte-swap instruction
+        - pattern: "\\b(rev|rev16|rev32)\\b"
+          type: regex
+          scope: instruction
+          description: arm64 reverse-bytes instruction
+    x64_constructs:
+      - "bswap rax"
+      - "bswap eax"
+      - "movbe rax, [rsi]"
+    arm64_constructs:
+      - "rev x0, x0"
+      - "rev w0, w0"
+      - "ldr x0, [x1]; rev x0, x0"
+    pitfalls:
+      - 16-bit byte-swap (no x64 native) uses rev16 w0, w0
+      - movbe store form requires a temp register since the swap clobbers the source
+    validation_criteria:
+      - bswap translates to rev (64-bit) or rev w0,w0 (32-bit)
+      - movbe decomposes into separate load/swap or swap/store sequence
+
+  - id: 5
+    name: rep-string-operations
+    category: bulk-memory
+    description: >
+      arm64 has no string instructions. Translate rep movs/stos to memcpy/
+      memset (large/unknown size) or unrolled ldp/stp loop (perf-critical).
+      DF flag has no equivalent — reverse copies need explicit decrement.
+    metadata:
+      match_rules:
+        - pattern: "\\brep[en]?\\s+(movs[bwdq]?|stos[bwdq]?|lods[bwdq]?|scas[bwdq]?)\\b"
+          type: regex
+          scope: instruction
+          description: x64 REP-prefixed string instruction
+        - pattern: "\\b(std|cld)\\b"
+          type: regex
+          scope: instruction
+          description: x64 direction-flag set/clear (no arm64 equivalent)
+    x64_constructs:
+      - "rep movsb"
+      - "rep stosb"
+      - "rep movsq"
+      - "std; rep movsb"
+    arm64_constructs:
+      - "bl memcpy   ; or unrolled ldr/str loop"
+      - "bl memset   ; or str xzr loop (16 bytes/iter)"
+      - "ldp x0, x1, [x2], #16; stp x0, x1, [x3], #16; subs x4, x4, #1; b.ne .L"
+      - "// reverse copy: explicit pointer decrement, no flag"
+    pitfalls:
+      - arm64 has no DF equivalent; reverse-direction copies must be open-coded with explicit pointer decrement
+      - rep stosb zeroes — str xzr is cheaper than loading a zero into a register first
+    validation_criteria:
+      - All rep instructions translate to either a library call or an explicit unrolled loop
+      - Reverse-direction copies use explicit decrement
+
+  - id: 6
+    name: cache-management
+    category: cache
+    description: >
+      clflush/clflushopt/clwb translate to dc civac/cvac/cvap. Often need a
+      dsb ish after to ensure completion before dependent operations. May
+      require kernel privilege depending on SCTLR_EL1.
+    metadata:
+      match_rules:
+        - pattern: "\\b(clflush|clflushopt|clwb)\\b"
+          type: regex
+          scope: instruction
+          description: x64 cache-line management instruction
+        - pattern: "\\bdc\\s+(civac|cvac|cvap|cvau|ivac|isw|csw|cisw)\\b"
+          type: regex
+          scope: instruction
+          description: arm64 data-cache maintenance instruction
+    x64_constructs:
+      - "clflush [mem]"
+      - "clflushopt [mem]"
+      - "clwb [mem]"
+    arm64_constructs:
+      - "dc civac, x0"
+      - "dc cvac, x0"
+      - "dc cvap, x0"
+    pitfalls:
+      - arm64 cache-management instructions sometimes require kernel privilege depending on SCTLR_EL1 — verify target supports user-space cache ops
+    validation_criteria:
+      - Cache flushes are followed by dsb ish if completion is required before subsequent operations
+
+  - id: 7
+    name: prefetch
+    category: cache
+    description: >
+      prefetchnta/t0/t1/t2 translate to prfm with target-level encoding
+      (pldl1strm / pldl1keep / pldl2keep / pldl3keep). Some arm64 cores treat
+      prfm as no-op; benchmark.
+    metadata:
+      match_rules:
+        - pattern: "\\bprefetch(nta|t[012])\\b"
+          type: regex
+          scope: instruction
+          description: x64 prefetch instruction
+        - pattern: "\\bprfm\\s+(pld|pst|pli)l[123](keep|strm)\\b"
+          type: regex
+          scope: instruction
+          description: arm64 prefetch-memory instruction
+    x64_constructs:
+      - "prefetchnta [mem]"
+      - "prefetcht0 [mem]"
+      - "prefetcht1 [mem]"
+      - "prefetcht2 [mem]"
+    arm64_constructs:
+      - "prfm pldl1strm, [x0]"
+      - "prfm pldl1keep, [x0]"
+      - "prfm pldl2keep, [x0]"
+      - "prfm pldl3keep, [x0]"
+    pitfalls:
+      - Some arm64 implementations treat all prfm variants as no-ops; benchmark before assuming the prefetch is doing work
+    validation_criteria:
+      - All prefetch* translate to prfm with appropriate cache-level encoding
+
+  - id: 8
+    name: timestamp-and-pause
+    category: special-instructions
+    description: >
+      rdtsc/rdtscp translate to mrs x0, cntvct_el0 (single 64-bit read).
+      pause translates to yield. cntvct_el0 frequency is in cntfrq_el0; not
+      always nanosecond granularity.
+    metadata:
+      match_rules:
+        - pattern: "\\b(rdtsc|rdtscp)\\b"
+          type: regex
+          scope: instruction
+          description: x64 timestamp instruction
+        - pattern: "\\bpause\\b"
+          type: regex
+          scope: instruction
+          description: x64 spin-loop pause hint
+    x64_constructs:
+      - "rdtsc"
+      - "rdtscp"
+      - "pause"
+    arm64_constructs:
+      - "mrs x0, cntvct_el0"
+      - "yield"
+    pitfalls:
+      - cntvct_el0 is virtual time (paravirtualized in VMs); frequency varies — read cntfrq_el0 for scaling
+      - yield is the spin hint; wfe (wait-for-event) is heavier and suspends the CPU
+    validation_criteria:
+      - rdtsc/rdtscp translate to mrs cntvct_el0
+      - pause translates to yield
+
+  - id: 9
+    name: cpuid-feature-detection
+    category: special-instructions
+    description: >
+      arm64 has no user-space cpuid. midr_el1 is EL1-only (kernel mode).
+      Replace cpuid checks with OS API calls (getauxval/sysctl/IsProcessor-
+      FeaturePresent) and cache results.
+    metadata:
+      match_rules:
+        - pattern: "\\bcpuid\\b"
+          type: regex
+          scope: instruction
+          description: x64 cpuid instruction (no arm64 user-space equivalent)
+    x64_constructs:
+      - "mov eax, 1; cpuid    ; feature flags in ECX/EDX"
+    arm64_constructs:
+      - "// Linux: getauxval(AT_HWCAP) / AT_HWCAP2"
+      - "// Apple: sysctlbyname(\"hw.optional.arm.<feature>\", ...)"
+      - "// Windows: IsProcessorFeaturePresent(...)"
+    pitfalls:
+      - Asm code must not contain cpuid directly; wrap behind a C-level feature-detection function compiled separately
+    validation_criteria:
+      - No cpuid instruction remains in arm64 path
+      - Feature detection is delegated to OS API calls performed in C

@@ -1,0 +1,259 @@
+version: "1.0"
+generated_from: skills/sse-avx-to-neon/references/specs/avx-decomposition.md
+description: >
+  Decomposition patterns for porting AVX 256-bit intrinsics to ARM NEON's
+  128-bit registers — covers loading, basic element-wise ops, cross-lane
+  permutes, broadcast, extract/insert, gather fallbacks, and storing.
+
+specs:
+  - id: 1
+    name: load-split-256bit
+    category: register-width
+    description: >
+      ARM NEON has no 256-bit registers. Load 256-bit data as two 128-bit
+      NEON vectors using two vld1q calls at offset 0 and 4 (for 32-bit
+      elements). For wrapper structs, cast the address and load each half.
+    metadata:
+      match_rules:
+        - pattern: "_mm256_(load|loadu)_(si256|ps|pd)"
+          type: regex
+          scope: intrinsic_call
+          description: Any 256-bit AVX load intrinsic
+        - pattern: "\\b__m256[id]?\\b"
+          type: regex
+          scope: declaration
+          description: 256-bit AVX register type declarations
+    x64_constructs:
+      - _mm256_loadu_si256
+      - _mm256_load_si256
+      - _mm256_loadu_ps
+      - _mm256_loadu_pd
+      - "(__m128i*)&val for wrapper struct halves"
+    arm64_constructs:
+      - "vld1q_s32(ptr + 0) for low half"
+      - "vld1q_s32(ptr + 4) for high half"
+      - "vld1q_f32(fptr + 0) / vld1q_f32(fptr + 4)"
+      - "vld1q_s8((const int8_t*)&val.lo) for wrapper struct"
+    pitfalls:
+      - Index offset depends on element size — 4 for 32-bit, 8 for 16-bit, 16 for 8-bit
+      - Pointer-cast through __m256i relies on little-endian layout matching x86
+      - Do not use a single 128-bit load — half the data will be missed
+    validation_criteria:
+      - Each AVX 256-bit load is replaced by two adjacent vld1q calls
+      - No __m256i / __m256 / __m256d types remain in ARM64 code path
+
+  - id: 2
+    name: basic-elementwise-decomposition
+    category: register-width
+    description: >
+      For any element-wise AVX operation (add, sub, mul, div, and/or/xor,
+      min/max, compare, shift), apply the 128-bit SSE equivalent to each
+      half independently — produce r_lo and r_hi from a_lo/b_lo and
+      a_hi/b_hi.
+    metadata:
+      match_rules:
+        - pattern: "_mm256_(add|sub|mul|div|and|or|xor|min|max|cmp|sll|srl|sra|sllv|srlv|srav)_"
+          type: regex
+          scope: intrinsic_call
+          description: Element-wise AVX 256-bit arithmetic / logical / compare / shift intrinsics
+    x64_constructs:
+      - _mm256_add_epi32
+      - _mm256_add_ps
+      - _mm256_add_pd
+      - _mm256_sub_epi32
+      - _mm256_mul_ps
+      - _mm256_and_si256
+      - _mm256_min_epi32
+      - _mm256_cmpeq_epi32
+    arm64_constructs:
+      - "vaddq_s32(a_lo, b_lo) / vaddq_s32(a_hi, b_hi)"
+      - "vaddq_f32(a_lo, b_lo) / vaddq_f32(a_hi, b_hi)"
+      - "vaddq_f64(a_lo, b_lo) / vaddq_f64(a_hi, b_hi)  (AArch64 only)"
+      - "Apply 128-bit SSE-equivalent NEON intrinsic to each half"
+    pitfalls:
+      - "vaddq_f64 and other float64 ops require AArch64 — guard with defined(__aarch64__)"
+      - Do not collapse two halves into one vector — element count would drop from 8 to 4
+      - The two halves must use independent operands (a_lo with b_lo, a_hi with b_hi)
+    validation_criteria:
+      - Each AVX element-wise op produces two 128-bit NEON ops on independent halves
+      - Result is held in r_lo + r_hi (two int32x4_t / float32x4_t / float64x2_t variables)
+
+  - id: 3
+    name: cross-lane-broadcast
+    category: cross-lane
+    description: >
+      _mm256_broadcastss_ps and _mm256_broadcastd_epi32 broadcast the lowest
+      element to all 8 lanes. Extract the source lane scalar with vgetq_lane,
+      then vdupq_n into both result halves.
+    metadata:
+      match_rules:
+        - pattern: "_mm256_broadcast"
+          type: prefix
+          scope: intrinsic_call
+          description: AVX2 broadcast intrinsics (broadcastss, broadcastd, broadcastq, etc.)
+    x64_constructs:
+      - _mm256_broadcastss_ps
+      - _mm256_broadcastd_epi32
+      - _mm256_broadcastq_epi64
+      - _mm256_broadcastb_epi8
+    arm64_constructs:
+      - "vdupq_n_f32(vgetq_lane_f32(src_lo, 0)) for both halves"
+      - "vdupq_n_s32(vgetq_lane_s32(src_lo, 0)) for both halves"
+    pitfalls:
+      - Both halves get the same broadcast value — do not duplicate the extract
+      - vdupq_n is the broadcast intrinsic, vgetq_lane is the scalar extract
+    validation_criteria:
+      - Source lane extracted once with vgetq_lane
+      - Both r_lo and r_hi are produced with vdupq_n_<type> of that scalar
+
+  - id: 4
+    name: cross-lane-extract-insert-128
+    category: cross-lane
+    description: >
+      _mm256_extracti128_si256 returns one of the two 128-bit halves;
+      _mm256_inserti128_si256 replaces one half. In NEON these become direct
+      assignments since the halves are already separate variables.
+    metadata:
+      match_rules:
+        - pattern: "_mm256_(extract|insert)i128_si256"
+          type: regex
+          scope: intrinsic_call
+          description: 128-bit lane extract/insert in 256-bit AVX2 register
+        - pattern: "_mm256_(extract|insert)f128_(ps|pd)"
+          type: regex
+          scope: intrinsic_call
+          description: 128-bit lane extract/insert for float/double AVX register
+    x64_constructs:
+      - _mm256_extracti128_si256
+      - _mm256_inserti128_si256
+      - _mm256_extractf128_ps
+      - _mm256_insertf128_ps
+    arm64_constructs:
+      - "extract lane 0 → result = a_lo"
+      - "extract lane 1 → result = a_hi"
+      - "insert lane 0 → r_lo = b128, r_hi = a_hi"
+      - "insert lane 1 → r_lo = a_lo, r_hi = b128"
+    pitfalls:
+      - The imm8 lane index (0 or 1) becomes a compile-time selection of which half variable to use
+      - Do not emit a runtime branch — the lane index is always a constant
+    validation_criteria:
+      - Extract becomes a direct copy of a_lo or a_hi
+      - Insert produces r_lo / r_hi with one half from b128 and the other from a
+
+  - id: 5
+    name: cross-lane-permute2-128
+    category: cross-lane
+    description: >
+      _mm256_permute2f128_ps / _mm256_permute2x128_si256 select 128-bit halves
+      from a or b under an imm8 mask. Encode imm8 bits to choose source halves
+      via a small array of pointers, with a zero override on bit 3 / bit 7.
+    metadata:
+      match_rules:
+        - pattern: "_mm256_permute2[fx]128_"
+          type: regex
+          scope: intrinsic_call
+          description: AVX2 cross-128-bit-lane permute of two 256-bit registers
+    x64_constructs:
+      - _mm256_permute2f128_ps
+      - _mm256_permute2x128_si256
+    arm64_constructs:
+      - "const T* srcs[4] = { &a_lo, &a_hi, &b_lo, &b_hi };"
+      - "r_lo = (imm8 & 0x08) ? vdupq_n_*(0) : *srcs[imm8 & 0x03]"
+      - "r_hi = (imm8 & 0x80) ? vdupq_n_*(0) : *srcs[(imm8 >> 4) & 0x03]"
+    pitfalls:
+      - Bits 3 and 7 zero the destination half — must check before indexing srcs
+      - Source indices use only bits [1:0] and [5:4] of imm8
+      - For compile-time imm8, prefer to specialise instead of branching
+    validation_criteria:
+      - imm8 is decoded via mask into source-half pointer index plus zero check
+      - Permute produces r_lo and r_hi independently
+
+  - id: 6
+    name: cross-lane-set-m128i
+    category: cross-lane
+    description: >
+      _mm256_set_m128i(hi, lo) and _mm256_setr_m128i(lo, hi) construct a
+      256-bit value from two 128-bit halves. In NEON this is just two
+      assignments (r_lo = lo_128; r_hi = hi_128).
+    metadata:
+      match_rules:
+        - pattern: "_mm256_setr?_m128[id]?"
+          type: regex
+          scope: intrinsic_call
+          description: Construct AVX 256-bit register from two 128-bit halves
+    x64_constructs:
+      - _mm256_set_m128i
+      - _mm256_setr_m128i
+      - _mm256_set_m128
+      - _mm256_setr_m128d
+    arm64_constructs:
+      - "r_lo = lo_128; r_hi = hi_128;"
+    pitfalls:
+      - _mm256_set_m128i takes hi first then lo — do not swap when copying
+      - _mm256_setr_m128i takes lo first then hi (reversed)
+    validation_criteria:
+      - No _mm256_set_m128* calls remain in ARM64 path
+      - Two halves are assigned with correct hi/lo association
+
+  - id: 7
+    name: gather-scalar-fallback
+    category: memory-access
+    description: >
+      Baseline NEON has no gather instruction. Replace _mm256_i32gather_* with
+      a scalar loop that stores the 8 indices, performs 8 scalar loads, then
+      reloads the result into two 128-bit NEON vectors.
+    metadata:
+      match_rules:
+        - pattern: "_mm256_(i32|i64)gather_"
+          type: regex
+          scope: intrinsic_call
+          description: AVX2 256-bit gather intrinsics
+        - pattern: "_mm_(i32|i64)gather_"
+          type: regex
+          scope: intrinsic_call
+          description: SSE 128-bit gather intrinsics (also have no NEON equivalent)
+    x64_constructs:
+      - _mm256_i32gather_epi32
+      - _mm256_i32gather_ps
+      - _mm256_i64gather_epi64
+    arm64_constructs:
+      - "vst1q_s32(idx + 0, idx_lo); vst1q_s32(idx + 4, idx_hi);"
+      - "for (int i = 0; i < 8; i++) out[i] = *(const T*)(base + idx[i] * scale);"
+      - "r_lo = vld1q_s32(out + 0); r_hi = vld1q_s32(out + 4);"
+      - "SVE2 gather loads (optional, requires runtime check)"
+    pitfalls:
+      - Scalar fallback is significantly slower — profile before assuming SIMD wins
+      - The scale factor in x64 gather is in bytes; remember to multiply explicitly
+      - Do not attempt to synthesize gather with multiple vld1q — wrong semantics
+    validation_criteria:
+      - No _mm256_*gather_* or _mm_*gather_* in ARM64 code path
+      - Gather emulation uses scratch arrays for indices and outputs
+
+  - id: 8
+    name: store-256bit-result
+    category: memory-access
+    description: >
+      Store the two NEON halves back to memory at offsets 0 and 4 (for 32-bit
+      elements). For wrapper structs with .lo/.hi fields, store each half via
+      cast pointer.
+    metadata:
+      match_rules:
+        - pattern: "_mm256_(store|storeu)_(si256|ps|pd)"
+          type: regex
+          scope: intrinsic_call
+          description: AVX 256-bit store intrinsics
+    x64_constructs:
+      - _mm256_storeu_si256
+      - _mm256_store_si256
+      - _mm256_storeu_ps
+      - _mm256_storeu_pd
+    arm64_constructs:
+      - "vst1q_s32((int32_t*)dst + 0, r_lo);"
+      - "vst1q_s32((int32_t*)dst + 4, r_hi);"
+      - "vst1q_s32((int32_t*)&r.lo, r_lo); vst1q_s32((int32_t*)&r.hi, r_hi);"
+    pitfalls:
+      - Index offsets must match element width (4 for 32-bit, 8 for 16-bit, 16 for 8-bit)
+      - Stores go to offsets 0 and the AVX-half boundary — not 0 and 16 (bytes)
+    validation_criteria:
+      - Each AVX 256-bit store is replaced by two adjacent vst1q calls
+      - r_lo precedes r_hi in memory order

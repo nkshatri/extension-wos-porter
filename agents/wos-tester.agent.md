@@ -1,5 +1,5 @@
 ---
-description: "Run and fix tests and benchmarks for Windows ARM64. Use when: executing built ARM64 test suites, running performance benchmarks on ARM64, diagnosing and fixing ARM64-specific test failures (illegal instruction, alignment, weak memory ordering, x86-only assertions, DLL load errors), recording pass/fail/skip results, capturing benchmark numbers."
+description: "Run tests and benchmarks on already-built Windows ARM64 binaries and fix ARM64-specific failures (illegal-instruction, alignment, weak memory ordering, x86-only assertions, DLL loads)."
 name: "wos-tester"
 tools: [execute, read, edit, search, todo]
 argument-hint: "Provide the local project path with already-built ARM64 binaries"

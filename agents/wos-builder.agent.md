@@ -1,5 +1,5 @@
 ---
-description: "Build, validate, and test a project for Windows ARM64. Use when: building ARM64 binaries, validating ARM64 architecture with dumpbin, running ARM64 tests, fixing ARM64 build errors, compiling tests and examples for ARM64, verifying build artifacts, resolving ARM64-specific compilation failures."
+description: "Build a project for Windows ARM64 and validate binaries with dumpbin. Iteratively fixes ARM64 compile/link errors. Consumes wos-toolchain-discovery skill."
 name: "wos-builder"
 tools: [execute, read, edit, search, todo]
 argument-hint: "Provide the local project path to build for ARM64"
@@ -53,15 +53,11 @@ You are the **Windows ARM64 Build & Validation Agent**. Given a local project pa
 
 ## Phase 2: Toolchain Setup
 
-1. **Find Visual Studio**:
-   ```powershell
-   $vsPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
-   ```
-2. **Find ARM64 cl.exe** (look for `Hostx64\arm64\cl.exe`, fallback `Hostarm64\arm64`).
-3. **Find MSBuild** via vswhere.
-4. **Find dumpbin** (critical for Phase 5) — typically under `Hostx64\x64`.
-5. **Find other tools**: cmake, cargo, go, meson, ninja, dotnet, etc.
-6. **Locate vcvars**: `$vcvarsArm64 = Join-Path $vsPath "VC\Auxiliary\Build\vcvarsamd64_arm64.bat"`
+Load the [wos-toolchain-discovery](../skills/wos-toolchain-discovery/SKILL.md) skill and run it against the project path. It populates `$hostArch`, `$vsPath`, `$cl`, `$msbuild`, `$dumpbin`, `$vcvars` (cached in `<repo>\.copilot\state\wos-toolchain.json` so subsequent invocations skip the discovery cost). If invoked from `wos-porter`, the cache already exists — just read it.
+
+Also probe optional tools if the build system requires them: `Get-Command cmake, cargo, go, meson, ninja, dotnet -ErrorAction SilentlyContinue`.
+
+If `$cl` / `$msbuild` / `$dumpbin` fail to resolve, report BLOCKING and stop.
 
 ---
 

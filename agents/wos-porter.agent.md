@@ -1,5 +1,5 @@
 ---
-description: "Port an open-source x64 application to Windows ARM64. Use when: porting GitHub repos to ARM64, adding ARM64 support to Windows applications, creating ARM64 build configurations for CMake MSBuild Meson Make Cargo Autotools Bazel GN Premake SCons Waf qmake xmake B2 Go node-gyp .NET Gradle Python, converting x64 SIMD to NEON, generating ARM64 porting patches."
+description: "Port an open-source x64 application to Windows ARM64. Use when: porting a GitHub repo to ARM64, adding ARM64 build/source support, converting x64 SIMD to NEON, or generating an ARM64 porting patch."
 name: "wos-porter"
 tools: [execute, read, edit, search, web, agent, todo]
 agents: [wos-analyzer, wos-build-porter, wos-code-porter, wos-builder, wos-tester, wos-optimizer]
@@ -27,7 +27,15 @@ The 8 phases you MUST execute in this exact order — each phase has a REQUIRED 
 ## Phase 1: Setup
 
 1. Parse and validate the GitHub URL (accept `https://github.com/owner/repo`, `owner/repo`, etc.)
-2. Clone to `C:\src\wos-porter\<repoName>` and create `arm64-port` branch. Create the parent directory `C:\src\wos-porter` first if it does not exist (`New-Item -ItemType Directory -Force -Path C:\src\wos-porter`). If the target folder already exists, reuse it (skip clone) or remove it first — do NOT fall back to `$env:TEMP`.
+2. Resolve the work root and clone target. Honour the `WOS_PORTER_WORKDIR` environment variable if set; otherwise default to `C:\src\wos-porter` on Windows or `$HOME/wos-porter` elsewhere. Never fall back to `$env:TEMP` — the location must be stable across phases so `<workDir>\.copilot\state\wos-toolchain.json` survives.
+   ```powershell
+   $workRoot = if ($env:WOS_PORTER_WORKDIR) { $env:WOS_PORTER_WORKDIR }
+               elseif ($IsWindows -or $env:OS -eq 'Windows_NT') { 'C:\src\wos-porter' }
+               else { Join-Path $HOME 'wos-porter' }
+   New-Item -ItemType Directory -Force -Path $workRoot | Out-Null
+   $workDir = Join-Path $workRoot $repoName
+   ```
+   Clone into `$workDir` and create the `arm64-port` branch. If the target folder already exists, reuse it (skip clone) or remove it first. All subsequent references to `C:\src\wos-porter\<repoName>` in this document mean `$workDir` — substitute accordingly when the env var is set.
    - Clone with `git clone --recurse-submodules <url> <repoName>`. If the project uses Git LFS, also run `git lfs pull` (skip silently if `git lfs` is not installed and no LFS pointers exist).
    - If the repo was cloned without `--recurse-submodules` (e.g. reusing an existing folder), run `git submodule update --init --recursive` before creating the branch.
    - Verify with `git submodule status` — every line should show a commit hash without a leading `-` (missing) or `+` (out-of-date). If any submodule is missing/dirty, rerun `git submodule update --init --recursive --force` and report as blocking if it still fails.
@@ -45,15 +53,15 @@ The 8 phases you MUST execute in this exact order — each phase has a REQUIRED 
 
 ## Phase 2: Analysis
 
-4. Invoke `wos-analyzer` sub-agent with the repo path. **Keep the prompt under 200 words** — just provide the repo path and ask for the structured analysis report.
+4. Invoke `wos-analyzer` sub-agent with the repo path. **Keep the prompt under 250 words** — provide the repo path, request the structured analysis report, AND explicitly instruct it to load the [wos-woa-dashboard](../skills/wos-woa-dashboard/SKILL.md) skill for dependency classification and to emit the "Arm AppReady Assessment Summary" block plus the kernel-mode / hardcoded-arch-check / dashboard tables per its own output format.
 5. If ARM64 support is already **Full**: report to user and stop
 6. If **None** or **Partial**: proceed to Phase 3
 
 ## Phase 3: Porting
 
 7. Plan porting tasks on todo list based on analysis report
-8. Invoke `wos-build-porter` sub-agent. **Keep the prompt under 300 words** — provide repo path, build system type, and the specific changes needed from the analysis.
-9. Invoke `wos-code-porter` sub-agent. **Keep the prompt under 300 words** — provide repo path and the specific source files that need ARM64 guards from the analysis.
+8. Invoke `wos-build-porter` sub-agent. **Keep the prompt under 350 words** — provide repo path, build system type, the specific changes needed from the analysis, AND explicitly instruct it to read the matching per-build-system recipe instruction ([wos-build-recipes-cmake](../instructions/wos-build-recipes-cmake.instructions.md) / -msbuild / -cargo / -meson / -nodegyp / -python / -misc) and the [wos-ci-arm64](../instructions/wos-ci-arm64.instructions.md) recipe if any CI workflow files exist.
+9. Invoke `wos-code-porter` sub-agent. **Keep the prompt under 350 words** — provide repo path and the specific source files that need ARM64 guards from the analysis; note that deep NEON kernel work belongs to `wos-optimizer` in Phase 7 (do NOT hand-write NEON here beyond trivial 1:1 translations).
 10. Review changes with `git diff --stat`, verify no x64 breakage
 11. NEVER vendor SIMD translation-shim libraries (no `sse2neon.h`, `simde`, `xsimd`, `highway`, etc.). Any ARM64 SIMD code must be hand-written `<arm_neon.h>` intrinsics. The code-porter handles initial arch-guarding; deeper NEON kernel work happens in Phase 7.
 12. Do NOT commit yet — changes will be committed AFTER the build succeeds in Phase 5
@@ -63,55 +71,19 @@ The 8 phases you MUST execute in this exact order — each phase has a REQUIRED 
 
 ## Phase 4: Resolve Dependencies
 
-**You MUST run these exact terminal commands. Do not skip this phase. Do not simulate these commands.**
+**You MUST run the toolchain-discovery script. Do not skip this phase. Do not simulate these commands.**
 
-**Target is always Windows ARM64. Host can be either x64 (AMD64) or ARM64 — detect first, then pick the toolchain that matches. NEVER hardcode `Hostx64\arm64` or `vcvarsamd64_arm64.bat`; always select based on `$hostArch`.**
+14. Load the [wos-toolchain-discovery](../skills/wos-toolchain-discovery/SKILL.md) skill and run its discovery block. It (a) detects `$hostArch`, (b) resolves `$vsPath` / `$cl` / `$msbuild` / `$dumpbin` / `$vcvars` for the correct host-target layout (`HostARM64\ARM64` on ARM64, `Hostx64\arm64` on AMD64), (c) applies the emulation-fallback warning on ARM64 hosts missing the native toolset, and (d) persists everything to `<repo>\.copilot\state\wos-toolchain.json` so Phase 5/6/7/8 can read it back instead of re-running discovery.
 
-14. Detect host architecture and the matching toolchain layout:
-    ```powershell
-    $hostArch = $env:PROCESSOR_ARCHITECTURE   # AMD64 or ARM64
-    if ($hostArch -eq 'ARM64') {
-        $hostDir = 'HostARM64\ARM64'; $vcvars = 'vcvarsarm64.bat';        $dumpbinHost = 'HostARM64\ARM64'
-    } else {
-        $hostDir = 'Hostx64\arm64';   $vcvars = 'vcvarsamd64_arm64.bat'; $dumpbinHost = 'Hostx64\x64'
-    }
-    Write-Host "Host: $hostArch  Target: ARM64  Toolset: $hostDir  vcvars: $vcvars"
-    ```
-    **VERIFICATION: Output must show either Host=ARM64 with HostARM64\ARM64, or Host=AMD64 with Hostx64\arm64.**
+    **VERIFICATION**: `$vsPath`, `$cl`, `$msbuild`, `$dumpbin` all resolve to files on disk. If any is missing, report BLOCKING and skip directly to Phase 8. If the ARM64 native `cl.exe` is missing on an ARM64 host, WARN and recommend installing `MSVC v143 - ARM64/ARM64EC build tools (Latest) - ARM64 host`.
 
-15. Find Visual Studio:
-    ```powershell
-    $vsPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath; Write-Host "VS: $vsPath"
-    ```
-    On ARM64 hosts where `vswhere.exe` may be missing from `${env:ProgramFiles(x86)}`, also try `${env:ProgramFiles}\Microsoft Visual Studio\Installer\vswhere.exe`. **VERIFICATION: must show a real VS install path. If not, report as blocking.**
-
-16. Find the ARM64-target `cl.exe` for the detected host:
-    ```powershell
-    $cl = Get-ChildItem "$vsPath\VC\Tools\MSVC" -Recurse -Filter "cl.exe" | Where-Object { $_.FullName -match [regex]::Escape($hostDir) } | Select-Object -First 1 -ExpandProperty FullName
-    Write-Host "cl.exe: $cl"
-    ```
-    **VERIFICATION: path must end in `$hostDir\cl.exe`.** If not found AND host is ARM64, fall back ONCE to `Hostx64\arm64\cl.exe` (runs under x86 emulation) and WARN the user that the native ARM64 toolset is missing; recommend installing the `MSVC v143 - ARM64/ARM64EC build tools (Latest) - ARM64 host` component. If still not found, report as blocking and skip directly to Phase 8 (report).
-
-17. Find MSBuild (host-agnostic — pick the one matching the host so it runs natively):
-    ```powershell
-    $msbuild = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -requires Microsoft.Component.MSBuild -find "MSBuild\**\Bin\MSBuild.exe" | Where-Object { if ($hostArch -eq 'ARM64') { $_ -match 'arm64' } else { $_ -notmatch 'arm64' } } | Select-Object -First 1
-    if (-not $msbuild) { $msbuild = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -requires Microsoft.Component.MSBuild -find "MSBuild\**\Bin\MSBuild.exe" | Select-Object -First 1 }
-    Write-Host "MSBuild: $msbuild"
-    ```
-
-18. Find the matching `dumpbin.exe`:
-    ```powershell
-    $dumpbin = Get-ChildItem "$vsPath\VC\Tools\MSVC" -Recurse -Filter "dumpbin.exe" | Where-Object { $_.FullName -match [regex]::Escape($dumpbinHost) } | Select-Object -First 1 -ExpandProperty FullName
-    Write-Host "dumpbin: $dumpbin"
-    ```
-
-19. Check for other build tools and prefer ARM64-native ones when host is ARM64:
+15. (Optional) Check supporting tools and prefer ARM64-native ones when host is ARM64:
     ```powershell
     Get-Command cmake, ninja, vcpkg, python, node, perl, git -ErrorAction SilentlyContinue | Format-Table Name, Source
     ```
-    If host is ARM64 and any of these resolve to an x64-only build, note it and prefer the ARM64 build (e.g. ARM64 Python from python.org, ARM64 Node.js, ARM64 Git for Windows, ARM64 CMake). Do not block on this — just warn.
+    Warn — do not block — if any resolves to an x64-only build on ARM64 host.
 
-20. Install ARM64 **target** dependencies regardless of host. Detect the package manager(s) the project uses (look for manifest files), then use the ARM64 selector for each. NEVER install or link `x64-windows` libraries into the ARM64 build.
+16. Install ARM64 **target** dependencies regardless of host. Detect the package manager(s) the project uses (look for manifest files), then use the ARM64 selector for each. NEVER install or link `x64-windows` libraries into the ARM64 build.
 
     | Manager | Detect by | ARM64 install / target selector | Notes |
     |---|---|---|---|
@@ -124,28 +96,29 @@ The 8 phases you MUST execute in this exact order — each phase has a REQUIRED 
 
     For ANY manager: if a required dependency cannot be obtained or built for ARM64, do NOT silently substitute an x64 binary. Record it in the Phase 8 "Limitations & Known Issues" section with: package name, version, manager, what was tried, and the suggested workaround (build-from-source command, alternative package, feature-disable, or upstream issue link).
 
-21. Mark Phase 4 completed, mark Phase 5 in-progress on todo list. Carry `$hostArch`, `$cl`, `$msbuild`, `$dumpbin`, `$vcvars` forward into the Phase 5 sub-agent prompt.
+17. Mark Phase 4 completed, mark Phase 5 in-progress on todo list. Phase 5+ sub-agents will read `<repo>\.copilot\state\wos-toolchain.json` for `$hostArch`, `$cl`, `$msbuild`, `$dumpbin`, `$vcvars` — no need to re-pass them.
 
 ## Phase 5: Build & Fix Errors (MANDATORY — delegated to `wos-builder`)
 
 **GATE CHECK: You must have found MSBuild and the host-appropriate ARM64-target cl.exe in Phase 4. If Phase 4 reported blocking, skip directly to Phase 8 (report).**
 
-22. Invoke the `wos-builder` sub-agent. **Keep the prompt under 300 words.** Provide:
-    - The local repo path (`C:\src\wos-porter\<repoName>`)
+18. Invoke the `wos-builder` sub-agent. **Keep the prompt under 350 words.** Provide:
+    - The local repo path (`$workDir` from Phase 1 — substitute the resolved absolute path; do NOT hardcode `C:\src\wos-porter\...` because `WOS_PORTER_WORKDIR` may have overridden it)
     - The build system detected in Phase 2 and the primary target file (`.sln` / `CMakeLists.txt` / `Cargo.toml` / etc.)
+    - Explicit instruction to load the [wos-toolchain-discovery](../skills/wos-toolchain-discovery/SKILL.md) skill (it should read the cached `<workDir>\.copilot\state\wos-toolchain.json` written in Phase 4 rather than re-running discovery) and the [wos-build-error-recipes](../skills/wos-build-error-recipes/SKILL.md) skill when triaging any C-series / LNK / D80xx errors
     - **Host architecture** (`$hostArch`: AMD64 or ARM64) so the builder knows whether this is a cross-compile or native build
     - The exact toolchain paths from Phase 4: `$cl`, `$msbuild`, `$dumpbin`, `$vcvars` (e.g. `vcvarsarm64.bat` on ARM64 host, `vcvarsamd64_arm64.bat` on x64 host)
     - Reminder: target is always `ARM64` — MSBuild `/p:Platform=ARM64`, CMake `-A ARM64`, Cargo `--target aarch64-pc-windows-msvc`, vcpkg triplet `arm64-windows`. Never link x64 libraries.
     - A short note that build-system + source ARM64 changes are already applied on the `arm64-port` branch and that `wos-builder` should commit any build fixes on the same branch (do NOT create a new branch)
     - A request to also run `dumpbin /HEADERS` on all built .exe/.dll using `$dumpbin`. **Tests and benchmarks will be handled by `wos-tester` in Phase 6 — `wos-builder` should NOT run tests.**
 
-23. **VERIFICATION**: `wos-builder`'s final report MUST include real compiler output (file names being compiled, or error lines) and dumpbin machine type for each binary. If any of these are missing, ask `wos-builder` to rerun the missing step — do NOT fabricate output.
+19. **VERIFICATION**: `wos-builder`'s final report MUST include real compiler output (file names being compiled, or error lines) and dumpbin machine type for each binary. If any of these are missing, ask `wos-builder` to rerun the missing step — do NOT fabricate output.
 
-24. If `wos-builder` reports unresolved errors after its self-healing loop, capture the remaining error list verbatim for the Phase 8 report. Do not attempt a second build pass yourself — trust the sub-agent's result.
+20. If `wos-builder` reports unresolved errors after its self-healing loop, capture the remaining error list verbatim for the Phase 8 report. Do not attempt a second build pass yourself — trust the sub-agent's result.
 
-25. Confirm all changes (porting + build fixes) are committed on `arm64-port`: `git log --oneline main..arm64-port`
+21. Confirm all changes (porting + build fixes) are committed on `arm64-port`: `git log --oneline main..arm64-port`
 
-26. Mark Phase 5 completed, mark Phase 6 in-progress on todo list.
+22. Mark Phase 5 completed, mark Phase 6 in-progress on todo list.
 
 **Immediately proceed to Phase 6.**
 
@@ -153,21 +126,22 @@ The 8 phases you MUST execute in this exact order — each phase has a REQUIRED 
 
 Binary validation (dumpbin) was completed by `wos-builder` in Phase 5. Phase 6 runs the test suites and benchmarks via `wos-tester`.
 
-27. Invoke the `wos-tester` sub-agent. **Keep the prompt under 250 words.** Provide:
-    - The local repo path (`C:\src\wos-porter\<repoName>`)
+23. Invoke the `wos-tester` sub-agent. **Keep the prompt under 300 words.** Provide:
+    - The local repo path (`$workDir` from Phase 1 — substitute the resolved absolute path)
     - The current branch (`arm64-port`) and an instruction to commit any test fixes on the same branch — do NOT create a new branch
+    - Explicit instruction to read the cached toolchain state from `<workDir>\.copilot\state\wos-toolchain.json` (populated by [wos-toolchain-discovery](../skills/wos-toolchain-discovery/SKILL.md) in Phase 4) rather than re-running discovery
     - A pointer to where `wos-builder` placed the ARM64 build output (e.g. `build-arm64\Release`)
     - **Host architecture** (`$hostArch` from Phase 4): if ARM64, run tests/benchmarks natively; if AMD64, skip execution and report tests/benchmarks as "cross-compiled on x64 host — rerun on native ARM64" with exact rerun commands.
     - The `$dumpbin` path so any new test binaries can also be verified as `AA64`.
 
-28. From the `wos-tester` report, extract for the Phase 8 README and chat report:
+24. From the `wos-tester` report, extract for the Phase 8 README and chat report:
     - Test totals: passed / failed / skipped / timed out
     - The list of failures `wos-tester` fixed (with commit hashes)
     - The list of remaining failures with classification
     - The benchmark result file path(s) `wos-tester` wrote under `<workDir>\benchmarks\base_bench_win_arm.*` plus the headline benchmark numbers (or the "requires native ARM64 host" note)
-29. From `wos-builder`'s Phase 5 report, extract the dumpbin machine-type line for every built `.exe`/`.dll`. If any binary is NOT `AA64`, flag it as a porting issue for the Phase 8 report.
-30. Verify any test fixes are committed on `arm64-port`: `git log --oneline main..arm64-port`. Do not re-commit.
-31. Mark Phase 6 completed, mark Phase 7 in-progress on todo list.
+25. From `wos-builder`'s Phase 5 report, extract the dumpbin machine-type line for every built `.exe`/`.dll`. If any binary is NOT `AA64`, flag it as a porting issue for the Phase 8 report.
+26. Verify any test fixes are committed on `arm64-port`: `git log --oneline main..arm64-port`. Do not re-commit.
+27. Mark Phase 6 completed, mark Phase 7 in-progress on todo list.
 
 **Immediately proceed to Phase 7.**
 
@@ -181,9 +155,10 @@ After the project builds and tests pass on ARM64, scan for NEON-optimizable hot 
 - The project is pure managed code (.NET / Java / Go) with no native C/C++/Rust hot paths — NEON intrinsics don't apply.
 - The project is a trivial wrapper / CLI plumbing layer with no measurable hot code.
 
-32. Invoke the `wos-optimizer` sub-agent. **Keep the prompt under 400 words.** Provide:
-    - The local repo path (`C:\src\wos-porter\<repoName>`)
+28. Invoke the `wos-optimizer` sub-agent. **Keep the prompt under 450 words.** Provide:
+    - The local repo path (`$workDir` from Phase 1 — substitute the resolved absolute path)
     - The current branch (`arm64-port`) and an instruction to commit each optimization on the same branch, one commit per function (Tier A) or per file (Tier S)
+    - Explicit instruction to load the [wos-neon-reference](../skills/wos-neon-reference/SKILL.md) skill for the Windows ARM64 baseline ISA + SSE→NEON translation tables, and the [wos-forbidden-skip-reasons](../skills/wos-forbidden-skip-reasons/SKILL.md) skill for self-auditing its skip-reason column before returning the report
     - The verbatim build commands `wos-builder` used in Phase 5 (so the optimizer can rebuild after each change)
     - The verbatim test commands `wos-tester` used in Phase 6 (so the optimizer can re-validate; on x64 host, optimizer should build-only and skip test execution)
     - The benchmark file path under `<workDir>\benchmarks\base_bench_win_arm.*` if it exists, so before/after comparison is possible
@@ -193,60 +168,13 @@ After the project builds and tests pass on ARM64, scan for NEON-optimizable hot 
     - **NO translation-shim libraries**: the optimizer MUST hand-write all NEON code using `<arm_neon.h>` (C/C++), `core::arch::aarch64` (Rust), or `System.Runtime.Intrinsics.Arm.AdvSimd` (.NET). It MUST NOT vendor `sse2neon.h`, `simde`, `xsimd`, `highway`, or any other SIMD translation/abstraction library. This is non-negotiable; reinforce it explicitly in the prompt.
     - A reminder: NO other new dependencies, revert any change that fails to build or regresses a test, max 3 outer rounds of iteration.
 
-33. **VERIFICATION**: `wos-optimizer`'s final report MUST include EITHER (a) a non-empty "Functions optimized (Tier A)" table AND/OR a non-empty "Tier-S translations" table with per-commit hashes and (where host is ARM64) measured speedups, OR (b) an explicit "No high-confidence NEON opportunities found" statement that names every `*_sse.cpp` / `*_simd.cpp` / `*_avx.cpp` file in the repo and gives a concrete per-file reason for excluding it (license, build-system, test regression — NOT "out of scope"). The report MUST also include the "Rounds run" line from its Step 2.11. Anything in between (e.g. "I planned to optimize X" without a commit, or generic "opportunistic-optimization scope" excuses) is unacceptable — ask the optimizer to redo with concrete results, naming each previously-deferred SSE TU and either porting it via Tier S or giving a hard reason it can't.
+29. **VERIFICATION**: `wos-optimizer`'s final report MUST include EITHER (a) a non-empty "Functions optimized (Tier A)" table AND/OR a non-empty "Tier-S translations" table with per-commit hashes and (where host is ARM64) measured speedups, OR (b) an explicit "No high-confidence NEON opportunities found" statement that names every `*_sse.cpp` / `*_simd.cpp` / `*_avx.cpp` file in the repo and gives a concrete per-file reason for excluding it (license, build-system, test regression — NOT "out of scope"). The report MUST also include the "Rounds run" line from its Step 2.11. Anything in between (e.g. "I planned to optimize X" without a commit, or generic "opportunistic-optimization scope" excuses) is unacceptable — ask the optimizer to redo with concrete results, naming each previously-deferred SSE TU and either porting it via Tier S or giving a hard reason it can't.
 
-33a. **FORBIDDEN skip-reason audit**: scan every row of the optimizer's "Functions / files skipped" and "Tier-S translations" (kernels-deferred column) tables. Any row whose reason matches one of these patterns means the optimizer skipped a file with a non-justification and MUST be re-invoked to either hand-port or measure-and-revert that file:
+29a. **FORBIDDEN skip-reason audit**: load the [wos-forbidden-skip-reasons](../skills/wos-forbidden-skip-reasons/SKILL.md) skill for the canonical `$forbiddenPatterns` regex list and evidence rules. Run its "Usage snippet" against `$optimizerReport` (and `ARM64-PORT.md` if it exists). If any offending row is found, re-invoke `wos-optimizer` ONCE with a prompt that names every offending file and its forbidden pattern, instructing it to (i) hand-port with baseline ARMv8.0 NEON intrinsics and let the per-kernel benchmark gate decide, OR (ii) cite a VALID skip reason with concrete evidence (compiler error, test name, measured scalar/NEON numbers, vendored path, or named sibling file with measured perf). If a second report still uses any forbidden pattern, record those files in the Phase 8 README's "Limitations & Known Issues" verbatim, flagged as un-justified skips for human review.
 
-    ```powershell
-    $forbiddenPatterns = @(
-        # Size / effort
-        'would require .* LOC',
-        'no NEON port attempted',
-        'too large to hand-port',
-        'non-trivial port',
-        # Popularity / usage / age
-        '\brarely used\b',
-        'not benchmarked by upstream',
-        '\bacademic only\b',
-        '\bniche\b',
-        '\blegacy\b',
-        '\bobscure\b',
-        'deprecated by upstream',
-        # Optional-ISA-extension unavailability alone
-        'MSVC does not (auto-)?define\s+__ARM_FEATURE_',
-        '__ARM_FEATURE_\w+ not (set|defined|available)',
-        'target (CPU|SoC) does not implement',
-        'baseline ARMv8\.0 .* does not require',
-        # Unmeasured "fast enough"
-        'default .* path is .* fast',
-        'scalar fallback is (fine|fast|adequate|sufficient)',
-        'existing path is sufficient',
-        # Scope / deferral non-reasons
-        'could be ported.*deferred',
-        'out of (scope|opportunistic scope)',
-        'opportunistic[- ]only',
-        '\bfuture work\b',
-        'left as a follow[- ]up',
-        # Unsubstantiated duplication
-        'alternate .* implementation',
-        'sibling provides equivalent'
-    )
-    $offendingRows = @()
-    foreach ($p in $forbiddenPatterns) {
-        $matches = Select-String -InputObject $optimizerReport -Pattern $p -AllMatches
-        foreach ($m in $matches.Matches) { $offendingRows += @{ Pattern = $p; Line = $m.Value } }
-    }
-    if ($offendingRows) {
-        Write-Host "FORBIDDEN skip reasons detected — re-invoking optimizer" -ForegroundColor Yellow
-        $offendingRows | ForEach-Object { Write-Host "  - matches '$($_.Pattern)': $($_.Line)" }
-    }
-    ```
+30. Confirm the optimizer's commits land on `arm64-port` and the build is still green: `git log --oneline main..arm64-port; git status` (status must be clean). If any commit broke the build despite the optimizer's claims, revert it: `git revert --no-edit <bad-hash>`.
 
-    If `$offendingRows` is non-empty, re-invoke `wos-optimizer` ONCE with a prompt that lists every offending file and its forbidden reason, explicitly instructs the optimizer to either (i) hand-port the file using baseline ARMv8.0 NEON intrinsics and let the per-kernel benchmark gate decide, or (ii) cite a VALID skip reason from its Hard Constraints list with concrete evidence (compiler error line, test name, measured scalar/NEON numbers, vendored path, or named sibling file with measured perf). Do NOT accept a second report that still uses any forbidden pattern — if it does, record those files in the Phase 8 README's "Limitations & Known Issues" with the verbatim forbidden reason AND a note that the orchestrator's audit flagged them as un-justified skips that a human reviewer should re-examine.
-
-34. Confirm the optimizer's commits land on `arm64-port` and the build is still green: `git log --oneline main..arm64-port; git status` (status must be clean). If any commit broke the build despite the optimizer's claims, revert it: `git revert --no-edit <bad-hash>`.
-
-34a. **Coverage re-invocation gate**: enumerate SSE/AVX-heavy translation units in the repo and confirm each is accounted for:
+30a. **Coverage re-invocation gate**: enumerate SSE/AVX-heavy translation units in the repo and confirm each is accounted for:
 ```powershell
 $sseFiles = Get-ChildItem -Recurse -Include *_sse.cpp,*_sse2.cpp,*_ssse3.cpp,*_sse41.cpp,*_simd.cpp,*_avx.cpp,*_avx2.cpp -ErrorAction SilentlyContinue |
   ForEach-Object {
@@ -264,7 +192,7 @@ if ($unaddressed) {
 ```
 If `$unaddressed` is non-empty, re-invoke `wos-optimizer` ONCE more with a prompt that lists those exact files and demands a concrete per-file outcome (ported via Tier S / hand-ported under Tier A / hard-skipped with a non-generic reason from the SKIP set). Do this at most ONCE — the optimizer itself iterates internally up to 3 rounds; this is the outer safety net for cases where the optimizer's own re-scan missed a file.
 
-35. Capture for the Phase 8 report:
+31. Capture for the Phase 8 report:
     - Number of Tier-S file scaffolds + per-file kernel-ported / kernel-deferred counts (from the optimizer's Tier-S table)
     - Number of Tier-A functions optimized + the Tier-A table from the optimizer
     - Rounds run (from optimizer's Step 2.11) and reason loop terminated
@@ -272,183 +200,27 @@ If `$unaddressed` is non-empty, re-invoke `wos-optimizer` ONCE more with a promp
     - Benchmark delta table (or "deferred to native ARM64" note)
     - List of skipped candidates with concrete per-item reasons (no generic "out of scope"; cold Tier-S kernels deferred for "budget exhausted" are acceptable and expected)
 
-36. Mark Phase 7 completed, mark Phase 8 in-progress on todo list.
+32. Mark Phase 7 completed, mark Phase 8 in-progress on todo list.
 
 ## Phase 8: Report
 
-**MANDATORY SEMANTIC GATE CHECK — Do NOT trust sub-agent reports at face value. Re-verify against the filesystem and git BEFORE generating the Phase 8 report. String presence in a sub-agent's report is not proof; only the actual repo state counts.**
+**MANDATORY SEMANTIC GATE CHECK — do NOT trust sub-agent reports at face value. Re-verify against the filesystem and git BEFORE generating the report.**
 
-Run these checks in order. ANY failure → go back to the relevant phase and re-invoke the sub-agent with the specific gap. Do NOT proceed to step 37 until all checks pass (or the failure is recorded as a Known Limitation with a non-fabricated reason).
+The full G1–G8 verification script lives in the [wos-verify-port](../prompts/wos-verify-port.prompt.md) prompt. Invoke it with `<repoName>`:
 
-**CRITICAL — shell state does NOT persist between tool calls.** The `$cl`, `$msbuild`, `$dumpbin`, `$hostArch`, `$repoName`, `$testerReport`, and `$optimizerReport` variables you set in Phases 4-7 are `$null` in any fresh PowerShell invocation. You MUST re-derive them at the top of this gate block (and capture the sub-agent reports from your own conversation memory into the two `$*Report` variables) — do NOT assume they carry over, or every G2 check silently fails and the G5/G7 regex gates vacuously pass against empty strings.
+- It re-derives `$hostArch` / `$cl` / `$msbuild` / `$dumpbin` / `$vcvars` from `<repo>\.copilot\state\wos-toolchain.json` (shell state does NOT persist between tool calls).
+- Paste the verbatim `wos-tester` and `wos-optimizer` reports from your conversation record into its `$testerReport` / `$optimizerReport` here-strings.
+- It runs G1 (branch), G2 (toolchain), G3 (`dumpbin AA64` on every recent .exe/.dll), G4 (commits landed), G5 (numeric pass/fail), G6 (benchmark file), G7 (NEON commit count matches claim), G7b (SSE-TU coverage), G7c (forbidden-skip-reason regex — from the [wos-forbidden-skip-reasons](../skills/wos-forbidden-skip-reasons/SKILL.md) skill), G8 (clean tree).
 
-```powershell
-# --- Re-derive all carried state (shell does not persist between calls) ---
-$repoName = '<repoName>'                      # substitute the literal repo name from Phase 1
-$repoPath = "C:\src\wos-porter\$repoName"
-cd $repoPath
-$hostArch = $env:PROCESSOR_ARCHITECTURE       # AMD64 or ARM64
-$vsPath   = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
-if (-not $vsPath) { $vsPath = & "${env:ProgramFiles}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath }
-if ($hostArch -eq 'ARM64') { $hostDir = 'HostARM64\ARM64'; $dumpbinHost = 'HostARM64\ARM64' }
-else                       { $hostDir = 'Hostx64\arm64';   $dumpbinHost = 'Hostx64\x64' }
-$cl      = Get-ChildItem "$vsPath\VC\Tools\MSVC" -Recurse -Filter cl.exe -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match [regex]::Escape($hostDir) } | Select-Object -First 1 -ExpandProperty FullName
-$msbuild = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -requires Microsoft.Component.MSBuild -find "MSBuild\**\Bin\MSBuild.exe" | Select-Object -First 1
-$dumpbin = Get-ChildItem "$vsPath\VC\Tools\MSVC" -Recurse -Filter dumpbin.exe -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match [regex]::Escape($dumpbinHost) } | Select-Object -First 1 -ExpandProperty FullName
-# $testerReport / $optimizerReport: paste the verbatim text of each sub-agent's final report
-# (from your own conversation record) into these here-strings before running the gate:
-$testerReport    = @'
-<wos-tester final report text>
-'@
-$optimizerReport = @'
-<wos-optimizer final report text, or empty if Phase 7 was skipped>
-'@
-# --- End re-derivation ---
-
-$gateFailures = @()
-
-# G1: Phase 1 — repo is actually cloned and on arm64-port branch
-if (-not (Test-Path .git)) { $gateFailures += 'G1: not a git repo' }
-$branch = git rev-parse --abbrev-ref HEAD
-if ($branch -ne 'arm64-port') { $gateFailures += "G1: on branch '$branch', expected 'arm64-port'" }
-
-# G2: Phase 4 — VS + ARM64 toolchain were actually located (not just printed)
-if (-not $cl -or -not (Test-Path $cl)) { $gateFailures += "G2: \$cl path missing or invalid: '$cl'" }
-if (-not $msbuild -or -not (Test-Path $msbuild)) { $gateFailures += "G2: \$msbuild missing: '$msbuild'" }
-if (-not $dumpbin -or -not (Test-Path $dumpbin)) { $gateFailures += "G2: \$dumpbin missing: '$dumpbin'" }
-
-# G3: Phase 5 — at least one ARM64 binary actually exists on disk AND dumpbin confirms AA64
-$builtBins = Get-ChildItem -Recurse -Include *.exe,*.dll -ErrorAction SilentlyContinue |
-             Where-Object { $_.FullName -notmatch '\\\.git\\|\\node_modules\\|\\third_party\\prebuilt' -and $_.LastWriteTime -gt (Get-Date).AddHours(-2) }
-if (-not $builtBins) { $gateFailures += 'G3: no .exe/.dll built in the last 2 hours' }
-else {
-    $nonArm64 = @()
-    foreach ($b in $builtBins) {
-        $machine = & $dumpbin /HEADERS $b.FullName 2>&1 | Select-String 'machine \(' | Select-Object -First 1
-        if ($machine -notmatch 'AA64|ARM64') { $nonArm64 += "$($b.Name): $machine" }
-    }
-    if ($nonArm64) { $gateFailures += "G3: non-ARM64 binaries found: $($nonArm64 -join '; ')" }
-}
-
-# G4: Phase 5 — porting/build commits actually landed on arm64-port (not just claimed)
-$commitCount = (git log --oneline main..arm64-port 2>$null | Measure-Object).Count
-if ($commitCount -lt 1) {
-    # Allow zero only if analyzer reported "Full ARM64 support already" — otherwise fail.
-    $gateFailures += "G4: zero commits on arm64-port vs main; sub-agents claimed changes but none committed"
-}
-
-# G5: Phase 6 — test results have NUMBERS, not just a "ran tests" claim.
-# Re-parse the wos-tester report content you stored from Phase 6:
-if ($testerReport -notmatch 'Passed:\s*\d+' -or $testerReport -notmatch 'Failed:\s*\d+') {
-    # Acceptable alternative: explicit "Skipped — host is AMD64, cross-compiled" with the rerun commands.
-    if ($testerReport -notmatch 'cross-compiled|host is (AMD64|x64)|no tests discovered') {
-        $gateFailures += 'G5: wos-tester report lacks numeric pass/fail counts AND lacks a recognized skip reason'
-    }
-}
-
-# G6: Phase 6 — benchmark file exists on disk (or explicit cross-compile note in tester report)
-$benchFile = Get-ChildItem benchmarks\base_bench_win_arm.* -ErrorAction SilentlyContinue | Select-Object -First 1
-if (-not $benchFile -and $hostArch -eq 'ARM64' -and $testerReport -notmatch 'No benchmark targets|no benchmarks discovered') {
-    $gateFailures += 'G6: ARM64 host but no benchmarks\base_bench_win_arm.* file on disk'
-}
-
-# G7: Phase 7 — if optimizer claimed N functions optimized, verify N commits with the NEON: prefix exist
-if ($optimizerReport -match 'Functions optimized.*?Tier A.*?(\d+)') {
-    $claimedA = [int]$Matches[1]
-} elseif ($optimizerReport -match 'Functions optimized\s*[:\|].*?(\d+)') {
-    $claimedA = [int]$Matches[1]
-} else { $claimedA = 0 }
-if ($optimizerReport -match 'Tier-S translations.*?(\d+)\s*(?:file|entr)') {
-    $claimedS = [int]$Matches[1]
-} else { $claimedS = 0 }
-$claimed = $claimedA + $claimedS
-$neonCommits = (git log --oneline main..arm64-port --grep '^NEON:' 2>$null | Measure-Object).Count
-if ($claimed -gt 0 -and $neonCommits -lt $claimed) {
-    $gateFailures += "G7: optimizer claimed $claimed (Tier-A=$claimedA, Tier-S=$claimedS) but only $neonCommits 'NEON:' commits on branch"
-} elseif ($claimed -eq 0 -and $optimizerReport -notmatch 'No high-confidence|Skipped') {
-    $gateFailures += 'G7: optimizer report neither claims optimizations nor explicitly skips'
-}
-
-# G7b: coverage — every SSE-heavy TU in the repo must be either ported (commit referencing it) OR named in the optimizer's skip list with a concrete reason
-$sseFiles = Get-ChildItem -Recurse -Include *_sse.cpp,*_sse2.cpp,*_ssse3.cpp,*_sse41.cpp,*_simd.cpp,*_avx.cpp,*_avx2.cpp -ErrorAction SilentlyContinue |
-  ForEach-Object {
-    $hits = (Select-String -Path $_.FullName -Pattern '_mm_|__m128|__m256' -SimpleMatch -ErrorAction SilentlyContinue).Count
-    if ($hits -ge 20) { $_ }
-  }
-foreach ($f in $sseFiles) {
-    $name = Split-Path $f.FullName -Leaf
-    $inCommit = (git log --oneline main..arm64-port -- $f.FullName 2>$null | Measure-Object).Count -gt 0
-    $inSkipList = $optimizerReport -match [regex]::Escape($name)
-    if (-not $inCommit -and -not $inSkipList) {
-        $gateFailures += "G7b: SSE-heavy TU '$name' neither optimized nor mentioned in optimizer skip list"
-    }
-}
-
-# G7c: forbidden-skip-reason audit — the optimizer report AND the on-disk ARM64-PORT.md must NOT use any of the patterns the optimizer's Hard Constraints forbid.
-$forbiddenPatterns = @(
-    # Size / effort
-    'would require .* LOC',
-    'no NEON port attempted',
-    'too large to hand-port',
-    'non-trivial port',
-    # Popularity / usage / age — judgements about who uses the code are not skip reasons
-    '\brarely used\b',
-    'not benchmarked by upstream',
-    '\bacademic only\b',
-    '\bniche\b',
-    '\blegacy\b',
-    '\bobscure\b',
-    'deprecated by upstream',
-    # Optional-ISA-extension unavailability alone
-    'MSVC does not (auto-)?define\s+__ARM_FEATURE_',
-    '__ARM_FEATURE_\w+ not (set|defined|available)',
-    'target (CPU|SoC) does not implement',
-    'baseline ARMv8\.0 .* does not require',
-    # Unmeasured "fast enough"
-    'default .* path is .* fast',
-    'scalar fallback is (fine|fast|adequate|sufficient)',
-    'existing path is sufficient',
-    # Scope / deferral non-reasons
-    'could be ported.*deferred',
-    'out of (scope|opportunistic scope)',
-    'opportunistic[- ]only',
-    '\bfuture work\b',
-    'left as a follow[- ]up',
-    # Unsubstantiated duplication
-    'alternate .* implementation',
-    'sibling provides equivalent'
-)
-$artifactsToScan = @($optimizerReport)
-if (Test-Path 'ARM64-PORT.md') { $artifactsToScan += (Get-Content 'ARM64-PORT.md' -Raw) }
-foreach ($text in $artifactsToScan) {
-    foreach ($p in $forbiddenPatterns) {
-        if ($text -match $p) {
-            $gateFailures += "G7c: forbidden skip-reason pattern '$p' found — Tier-S file was skipped without a valid justification; re-invoke optimizer to hand-port or measure-and-revert"
-        }
-    }
-}
-
-# G8: Working tree clean — no half-applied changes
-$dirty = git status --porcelain
-if ($dirty) { $gateFailures += "G8: working tree dirty after Phase 7: $($dirty -join '; ')" }
-
-if ($gateFailures) {
-    Write-Host "GATE FAILURES:`n - $($gateFailures -join "`n - ")" -ForegroundColor Red
-    # For each G# failure, jump back to the corresponding phase and re-run that sub-agent
-    # with a prompt that NAMES the gap (e.g. "G3 failed: foo.exe is x64 not ARM64 — rebuild it").
-    # Do NOT proceed to the report. Do NOT fabricate.
-} else {
-    Write-Host "All semantic gates passed — proceeding to README + report." -ForegroundColor Green
-}
-```
+For EACH failing gate, re-invoke the corresponding sub-agent with a prompt naming the specific gap (e.g. "G3 failed: `foo.exe` is x64 not ARM64 — rebuild it"). Do NOT proceed to step 37 (the report itself) until all gates pass or a genuine limitation is recorded.
 
 **Anti-fabrication rules** (apply throughout Phase 8):
-- Every dumpbin line in the report MUST come from running dumpbin yourself in the gate block above — NOT copy-pasted from a sub-agent's text.
-- Every test pass/fail number MUST be re-extractable from a file (`Test-Path` the test result file) or be the explicit "skipped — cross-compile" string. If a sub-agent gave you numbers but no file/log exists on disk, treat them as fabricated and re-invoke.
-- Every benchmark value MUST resolve to a real entry inside `benchmarks/base_bench_win_arm.*`. If you cite "X% speedup", read the file and confirm the entry exists; otherwise say "deferred to native rerun".
-- Every commit hash you cite MUST appear in `git log --oneline main..arm64-port`. Run that command and verify; do not invent short hashes.
+- Every dumpbin line in the report MUST come from running dumpbin yourself in the gate block — not copy-pasted from a sub-agent's text.
+- Every test pass/fail number MUST be re-extractable from a file on disk OR be the explicit "skipped — cross-compile" string.
+- Every benchmark value MUST resolve to a real entry inside `benchmarks/base_bench_win_arm.*`.
+- Every commit hash cited MUST appear in `git log --oneline main..arm64-port`.
 
-37. **Create `ARM64-PORT.md` in the repo root** (`<workDir>\ARM64-PORT.md`) documenting the port. This file MUST be created on disk (not just printed in chat) and committed on the `arm64-port` branch. Use this exact template, filled with real data from Phases 1-6:
+33. **Create `ARM64-PORT.md` in the repo root** (`<workDir>\ARM64-PORT.md`) documenting the port. This file MUST be created on disk (not just printed in chat) and committed on the `arm64-port` branch. Use this exact template, filled with real data from Phases 1-6:
 
     ```markdown
     # Windows ARM64 Port
@@ -494,14 +266,17 @@ if ($gateFailures) {
     2. **Transfer the build**
        ```powershell
        # On the x64 build host — zip the repo + build output
-       cd C:\src\wos-porter
+       # ($workRoot is C:\src\wos-porter by default; overridden by $env:WOS_PORTER_WORKDIR)
+       $workRoot = if ($env:WOS_PORTER_WORKDIR) { $env:WOS_PORTER_WORKDIR } else { 'C:\src\wos-porter' }
+       Set-Location $workRoot
        Compress-Archive -Path <repoName> -DestinationPath <repoName>-arm64.zip -Force
        # Copy <repoName>-arm64.zip to the ARM64 device (USB / SMB / scp / OneDrive)
        ```
        On the ARM64 device:
        ```powershell
-       Expand-Archive -Path <repoName>-arm64.zip -DestinationPath C:\src\wos-porter -Force
-       cd C:\src\wos-porter\<repoName>
+       $workRoot = if ($env:WOS_PORTER_WORKDIR) { $env:WOS_PORTER_WORKDIR } else { 'C:\src\wos-porter' }
+       Expand-Archive -Path <repoName>-arm64.zip -DestinationPath $workRoot -Force
+       Set-Location (Join-Path $workRoot <repoName>)
        git checkout arm64-port   # if .git was included
        ```
 
@@ -569,6 +344,17 @@ if ($gateFailures) {
     All built binaries verified with `dumpbin /HEADERS` as machine type `AA64` (ARM64):
     <table: Binary | Machine | Size>
 
+    ## Arm AppReady Status
+    Aligns with the [Arm AppReady for Windows on Arm](https://developer.arm.com/laptops-and-desktops/windows-app-ready) program (Assess → Build → Deploy → Optimize).
+
+    - **Target profile**: <ARM64-native | ARM64EC-hybrid> — (`wos-analyzer` recommendation, based on blocking closed-source deps)
+    - **AppReady stages reached**: <Assess ✓ | Build ✓ | Deploy — n/a or ✓ | Optimize ✓ | ...>
+    - **WoA Ecosystem Dashboard status** (per key dependency; from `wos-woa-dashboard` skill lookup):
+      <table: Dependency | Version | Dashboard status (native / building / unsupported / unknown) | Citation>
+    - **Emulation vs native classification** (per component; Arm's three-way split):
+      <table: Component | Native ARM64 / Emulated x64 / Blocking | Notes>
+    - **Blockers requiring [Microsoft App Assure](https://learn.microsoft.com/en-us/microsoft-365/business/app-assure)**: <list, or "None — port completes without escalation">
+
     ## Limitations & Known Issues
     <bullet list of: features disabled on ARM64, performance regressions vs x64, tests skipped and why, dependencies not yet ARM64-ready, anything a downstream consumer must know — or "None">
 
@@ -576,10 +362,9 @@ if ($gateFailures) {
     The x64 build is unchanged. To build x64, switch back to `main` or use `/p:Platform=x64`.
     ```
 
-38. Commit the README: `git add ARM64-PORT.md; git commit -m "Add ARM64 porting documentation"`
+34. Commit the README: `git add ARM64-PORT.md; git commit -m "Add ARM64 porting documentation"`
 
-39. Generate the final structured report in chat. In the **Build Results** section, quote the actual last 5 lines of `wos-builder`'s build output. In the **Architecture Verification** section, quote the actual dumpbin machine type lines from its report. Reference the README path (`<workDir>\ARM64-PORT.md`) so the user knows where the full write-up lives.
-
+35. Generate the final structured report in chat. In the **Build Results** section, quote the actual last 5 lines of `wos-builder`'s build output. In the **Architecture Verification** section, quote the actual dumpbin machine type lines from its report. Reference the README path (`<workDir>\ARM64-PORT.md`) so the user knows where the full write-up lives.
 ```
 ## ARM64 Porting Complete
 

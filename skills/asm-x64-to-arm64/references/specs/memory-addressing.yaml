@@ -1,0 +1,256 @@
+version: "1.0"
+generated_from: skills/asm-x64-to-arm64/references/specs/memory-addressing.md
+description: >
+  Memory addressing translation: plain/offset/index/scaled/combined forms,
+  RIP-relative addressing, arm64-only pre/post-indexed and load-pair forms,
+  and PUSH/POP→STP/LDP stack-frame migration.
+
+specs:
+  - id: 1
+    name: plain-load-store
+    category: addressing
+    description: >
+      Plain register-indirect [reg] becomes ldr/str [xN]. Width is encoded in
+      the mnemonic and register name (w for 32-bit, x for 64-bit).
+    metadata:
+      match_rules:
+        - pattern: "mov\\s+\\w+\\s*,\\s*\\[\\s*r\\w+\\s*\\]"
+          type: regex
+          scope: instruction
+          description: x64 plain register-indirect load
+        - pattern: "mov\\s+\\[\\s*r\\w+\\s*\\]\\s*,\\s*\\w+"
+          type: regex
+          scope: instruction
+          description: x64 plain register-indirect store
+    x64_constructs:
+      - "mov rax, [rsi]"
+      - "mov [rsi], rax"
+    arm64_constructs:
+      - "ldr x0, [x1]"
+      - "str x0, [x1]"
+    pitfalls:
+      - Forgetting that mov-from-memory becomes ldr (not mov) on arm64
+    validation_criteria:
+      - All mov reg, [reg] patterns become ldr (load) or str (store)
+      - Register width matches via w (32-bit) or x (64-bit)
+
+  - id: 2
+    name: immediate-offset-addressing
+    category: addressing
+    description: >
+      [base + disp] becomes [xN, #imm] with 12-bit unsigned imm scaled by
+      access size. Negative offsets need ldur/stur (unscaled signed 9-bit) or
+      pre-computed address.
+    metadata:
+      match_rules:
+        - pattern: "\\[\\s*r\\w+\\s*[+-]\\s*\\d+\\s*\\]"
+          type: regex
+          scope: instruction
+          description: x64 base+displacement memory operand
+    x64_constructs:
+      - "mov rax, [rsi + 16]"
+      - "mov rax, [rsi - 16]"
+      - "mov rax, [rsi + 65536]"
+    arm64_constructs:
+      - "ldr x0, [x1, #16]"
+      - "ldur x0, [x1, #-16]"
+      - "add xT, x1, #65536; ldr x0, [xT]"
+    pitfalls:
+      - ldr immediate is scaled by access size; max for word access is 4*4095=16380, double-word 8*4095=32760
+      - Negative or unscaled offsets need ldur/stur, or pre-computed address
+    validation_criteria:
+      - All [base + disp] translations stay within 12-bit scaled-immediate range, or use ldur/stur, or compute address
+
+  - id: 3
+    name: register-index-addressing
+    category: addressing
+    description: >
+      [base + index] becomes [xN, xM] with no displacement. arm64 has no
+      [xN, xM, #imm] form — combine cases need decomposition.
+    metadata:
+      match_rules:
+        - pattern: "\\[\\s*r\\w+\\s*\\+\\s*r\\w+\\s*\\]"
+          type: regex
+          scope: instruction
+          description: x64 base+index memory operand (no scale, no displacement)
+    x64_constructs:
+      - "mov rax, [rsi + rdx]"
+    arm64_constructs:
+      - "ldr x0, [x1, x2]"
+    pitfalls:
+      - arm64 register-offset addressing has no displacement form
+    validation_criteria:
+      - "[base + index] translates to [xN, xM] only when there is no displacement"
+
+  - id: 4
+    name: scaled-index-addressing
+    category: addressing
+    description: >
+      [base + index*scale] becomes [xN, xM, lsl #N] when scale equals
+      log2(access_size). Mismatched scales require explicit add+ldr.
+    metadata:
+      match_rules:
+        - pattern: "\\[\\s*r\\w+\\s*\\+\\s*r\\w+\\s*\\*\\s*[1248]\\s*\\]"
+          type: regex
+          scope: instruction
+          description: x64 scaled-index memory operand
+    x64_constructs:
+      - "mov rax, [rsi + rdx*8]"
+      - "mov eax, [rsi + rdx*4]"
+      - "mov eax, [rsi + rdx*8]   ; scale != access size"
+    arm64_constructs:
+      - "ldr x0, [x1, x2, lsl #3]"
+      - "ldr w0, [x1, x2, lsl #2]"
+      - "add xT, x1, x2, lsl #3; ldr w0, [xT]"
+    pitfalls:
+      - Shift amount must equal log2(access_size); mismatch requires multi-instruction form
+      - Sign-extending index uses sxtw — [xN, wM, sxtw #2] not [xN, xM, lsl #2]
+    validation_criteria:
+      - "[base, index, lsl #N] form has N == log2(access_size)"
+      - Mismatched scales are decomposed into add + simple load
+
+  - id: 5
+    name: combined-scale-and-displacement
+    category: addressing
+    description: >
+      arm64 has no combined [xN, xM, lsl #N, #imm] form. x64 [base + index*scale
+      + disp] always decomposes to two instructions on arm64. Hoist the add
+      when reusing the temp.
+    metadata:
+      match_rules:
+        - pattern: "\\[\\s*r\\w+\\s*\\+\\s*r\\w+\\s*\\*\\s*[1248]\\s*[+-]\\s*\\d+\\s*\\]"
+          type: regex
+          scope: instruction
+          description: x64 fully-general memory operand (base + index*scale + disp)
+    x64_constructs:
+      - "mov rax, [rsi + rdx*4 + 16]"
+      - "lea rax, [rsi + rdx*4 + 16]"
+    arm64_constructs:
+      - "add xT, x1, x2, lsl #2; ldr w0, [xT, #16]"
+      - "add xT, x1, x2, lsl #2; add x0, xT, #16"
+    pitfalls:
+      - Most common spot where x64 collapses pointer arithmetic in 1 instruction; arm64 always needs 2
+      - Memory-heavy ports may grow 1.5x-2x in instruction count here
+    validation_criteria:
+      - "No attempt to write [xN, xM, lsl #N, #imm] (not a valid form)"
+      - Combined scale+disp is decomposed into add + ldr/str
+
+  - id: 6
+    name: rip-relative-addressing
+    category: addressing
+    description: >
+      [rip + symbol] becomes adrp + (add for address, ldr for value). Use
+      :lo12: relocation for page offset; :got: / :got_lo12: for GOT indirection.
+    metadata:
+      match_rules:
+        - pattern: "\\[\\s*rip\\s*[+-]\\s*\\w+\\s*\\]"
+          type: regex
+          scope: instruction
+          description: x64 RIP-relative memory operand
+        - pattern: "@GOTPCREL"
+          type: regex
+          scope: instruction
+          description: x64 GOT-indirect symbol reference
+    x64_constructs:
+      - "lea rax, [rip + symbol]"
+      - "mov rax, [rip + symbol]"
+      - "mov rax, [rip + sym@GOTPCREL]"
+    arm64_constructs:
+      - "adrp x0, symbol; add x0, x0, :lo12:symbol"
+      - "adrp x0, symbol; ldr x0, [x0, :lo12:symbol]"
+      - "adrp x0, :got:sym; ldr x0, [x0, :got_lo12:sym]"
+    pitfalls:
+      - adrp rounds to a 4 KB page boundary; forgetting the :lo12: add leaves the address page-aligned only
+      - Far symbols (>±4 GB) require GOT indirection; pure adrp+add fails at link time
+    validation_criteria:
+      - "All [rip + symbol] patterns become adrp + (add for address, ldr for value)"
+      - GOT-indirect symbols use :got: / :got_lo12: relocations
+
+  - id: 7
+    name: pre-post-indexed-addressing
+    category: addressing
+    description: >
+      arm64-only [xN, #imm]! (pre-index) and [xN], #imm (post-index) collapse
+      load + pointer-bump into one instruction. Exploit when x64 did
+      mov + add reg sequences.
+    metadata:
+      match_rules:
+        - pattern: "(mov|movzx|movsx)\\s+\\w+\\s*,\\s*\\[\\w+\\]\\s*\\n\\s*add\\s+\\w+\\s*,\\s*\\d+"
+          type: regex
+          scope: instruction
+          description: x64 load followed by add to same pointer (post-index opportunity)
+    x64_constructs:
+      - "mov rax, [rsi]; add rsi, 8"
+      - "add rsi, 8; mov rax, [rsi]"
+    arm64_constructs:
+      - "ldr x0, [x1], #8     ; post-index"
+      - "ldr x0, [x1, #8]!    ; pre-index"
+    pitfalls:
+      - Pre/post-index updates xN even if the load is conditional or exception-prone — surrounding code must not assume xN is unchanged
+    validation_criteria:
+      - Sequences of "load then increment pointer" use post-indexed form
+      - Sequences of "increment pointer then load" use pre-indexed form
+
+  - id: 8
+    name: load-store-pair
+    category: addressing
+    description: >
+      arm64-only ldp/stp reads/writes two consecutive same-width values in one
+      instruction. Standard prologue spill uses stp x29,x30,[sp,#-16]!.
+      Immediate is signed 7-bit scaled.
+    metadata:
+      match_rules:
+        - pattern: "\\b(ldp|stp)\\b"
+          type: regex
+          scope: instruction
+          description: arm64 load-pair / store-pair instruction
+        - pattern: "(mov|ldr)\\s+\\w+\\s*,\\s*\\[\\w+\\s*,\\s*#\\d+\\]\\s*\\n\\s*(mov|ldr)\\s+\\w+\\s*,\\s*\\[\\w+\\s*,\\s*#\\d+\\]"
+          type: regex
+          scope: instruction
+          description: Two consecutive same-base loads (ldp opportunity)
+    x64_constructs:
+      - "mov rax, [rsi]; mov rbx, [rsi + 8]"
+      - "mov [rsi], rax; mov [rsi + 8], rbx"
+    arm64_constructs:
+      - "ldp x0, x19, [x1]"
+      - "stp x0, x19, [x1]"
+      - "stp x29, x30, [sp, #-16]!    ; standard prologue"
+    pitfalls:
+      - ldp/stp immediate is signed 7-bit scaled — much smaller range than single ldr
+      - Both registers must be same width (x0,x1 or w0,w1 — not mixed)
+    validation_criteria:
+      - Adjacent same-width loads/stores are merged into ldp/stp
+      - stp/ldp offsets stay within signed 7-bit scaled range
+
+  - id: 9
+    name: push-pop-to-stp-ldp
+    category: stack-frame
+    description: >
+      arm64 has no PUSH/POP mnemonics. Use STP/LDP with pre/post-index. Single
+      saves pad to 16 bytes. Pre-index stp is atomic w.r.t. SP update under
+      async signals; separate sub+stp is not equivalent.
+    metadata:
+      match_rules:
+        - pattern: "\\b(push|pop)\\s+r"
+          type: regex
+          scope: instruction
+          description: x64 push/pop on x64 GP register
+        - pattern: "\\bsub\\s+sp\\s*,\\s*sp\\s*,\\s*#\\d+\\s*\\n\\s*stp\\b"
+          type: regex
+          scope: instruction
+          description: arm64 separate sub+stp (NOT equivalent to pre-indexed stp under signals)
+    x64_constructs:
+      - "push rbx"
+      - "push rbx; push rsi"
+      - "pop rsi; pop rbx"
+    arm64_constructs:
+      - "str x19, [sp, #-16]!     ; padded single save"
+      - "stp x19, x20, [sp, #-16]!"
+      - "ldp x19, x20, [sp], #16"
+    pitfalls:
+      - 8-byte SP adjustment is illegal on arm64 — single saves must pad to 16
+      - Separate sub sp + stp is NOT equivalent to pre-indexed stp under async signals
+    validation_criteria:
+      - No push/pop mnemonics remain in arm64 output
+      - Prologue saves use pre-indexed stp [sp, #-N]!; epilogue uses post-indexed ldp [sp], #N
+      - All such adjustments are multiples of 16

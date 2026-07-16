@@ -2,7 +2,7 @@
   "name": "wos-porter",
   "displayName": "WoS Porter - Windows ARM64 Porting Agent",
   "description": "AI-powered agents that automatically port open-source x64 Windows applications to native ARM64. Analyzes repos, ports build systems and source code, builds, validates binaries, and runs tests.",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "publisher": "wos-porter",
   "license": "BSD-3-Clause-Clear",
   "engines": {
@@ -32,23 +32,24 @@
     "commands": [
       {
         "command": "wosPorter.install",
-        "title": "WoS Porter: Install Agents"
+        "title": "WoS Porter: Install Assets"
       },
       {
         "command": "wosPorter.uninstall",
-        "title": "WoS Porter: Uninstall Agents"
+        "title": "WoS Porter: Uninstall Assets"
       },
       {
         "command": "wosPorter.status",
-        "title": "WoS Porter: Check Installation Status"
+        "title": "WoS Porter: Check Asset Status"
       }
     ]
   },
   "scripts": {
-    "vscode:prepublish": "npm run compile",
+    "vscode:prepublish": "npm run verify:manifests && npm run compile",
     "vscode:uninstall": "node uninstall.js",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
+    "verify:manifests": "node scripts/verify-manifests.js",
     "package": "vsce package",
     "publish": "vsce publish"
   },

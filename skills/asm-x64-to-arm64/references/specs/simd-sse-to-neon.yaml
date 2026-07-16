@@ -1,0 +1,319 @@
+version: "1.0"
+generated_from: skills/asm-x64-to-arm64/references/specs/simd-sse-to-neon.md
+description: >
+  SSE/AVX to NEON translation: register width and aliases (xmm/ymm/zmm vs
+  v/q/d/s), load/store, integer arithmetic with lane suffixes, bitwise
+  (PANDN operand swap), shifts, compares, shuffles/permutes, no-direct-
+  equivalent operations (PMOVMSKB, AES-NI), and inline-asm "=w" constraint.
+
+specs:
+  - id: 1
+    name: simd-register-width-and-aliases
+    category: simd
+    description: >
+      arm64 NEON is 128-bit; YMM/ZMM split into two/four V registers. NEON
+      lane views are .16b/.8h/.4s/.2d; scalar views are q/d/s/h/b. V8-V15 are
+      callee-saved (lower 64 bits only).
+    metadata:
+      match_rules:
+        - pattern: "\\bxmm\\d+\\b"
+          type: regex
+          scope: instruction
+          description: x64 XMM register reference
+        - pattern: "\\bymm\\d+\\b"
+          type: regex
+          scope: instruction
+          description: x64 YMM register (256-bit, must split on arm64)
+        - pattern: "\\bzmm\\d+\\b"
+          type: regex
+          scope: instruction
+          description: x64 ZMM register (512-bit, no NEON equivalent)
+    x64_constructs:
+      - "xmm0, xmm15"
+      - "ymm0     ; 256-bit"
+      - "zmm0     ; 512-bit"
+    arm64_constructs:
+      - "v0, v15  (alias q0, q15)"
+      - "v0 + v1  ; two 128-bit ops"
+      - "v0 + v1 + v2 + v3  ; four 128-bit ops"
+    pitfalls:
+      - V8-V15 callee-save obligation only covers lower 64 bits (D8-D15); save full Q if upper 64 bits are written
+      - _mm256_zeroupper() has no equivalent — remove entirely
+    validation_criteria:
+      - All xmm references become v (or q) in arm64 output
+      - Every ymm operation is split into two 128-bit v operations
+      - V8-V15 saves use full Q-register form when upper 64 bits are written
+
+  - id: 2
+    name: simd-load-store
+    category: simd
+    description: >
+      MOVDQA/MOVDQU/MOVAPS all become ldr q (alignment-safe by default).
+      Non-temporal store is stnp (pair). 256-bit load is two ldr q.
+      GP↔SIMD scalar transfer is fmov, not mov.
+    metadata:
+      match_rules:
+        - pattern: "\\b(movdq[au]|movap[ds]|movup[ds]|movnt(dq|i|pd))\\b"
+          type: regex
+          scope: instruction
+          description: x64 SSE/AVX 128-bit memory move
+        - pattern: "\\bv?movdqu?\\s+ymm"
+          type: regex
+          scope: instruction
+          description: x64 256-bit AVX memory move
+        - pattern: "\\bmov[dq]\\s+(xmm|eax|rax)"
+          type: regex
+          scope: instruction
+          description: GP↔XMM scalar transfer
+    x64_constructs:
+      - "movdqa xmm0, [rcx]"
+      - "vmovdqu ymm0, [rcx]"
+      - "movntdq [rcx], xmm0"
+      - "movd xmm0, eax"
+    arm64_constructs:
+      - "ldr q0, [x1]"
+      - "ldr q0, [x1]; ldr q1, [x1, #16]"
+      - "stnp q0, q1, [x1]"
+      - "fmov s0, w0"
+    pitfalls:
+      - movdqa vs movdqu distinction in source is informational only; both map to the same arm64 instruction
+      - stnp requires a register pair; single non-temporal store has no special hint
+      - "ld1/st1 immediate post-index must equal the access size (16 for a Q-form, 8 for a D-form); to advance by an arbitrary stride use the register post-index form [xN], xM. Arbitrary immediates like 'ld1 {v0.8h}, [x1], #32' fail to assemble."
+    validation_criteria:
+      - All SSE/AVX 128-bit loads/stores become ldr q / str q
+      - 256-bit loads/stores explicitly produce two 128-bit instructions
+      - GP↔SIMD scalar transfers use fmov
+      - ld1/st1 with an immediate post-index uses an immediate equal to the access size; arbitrary strides use a register post-index
+
+  - id: 3
+    name: simd-integer-arithmetic
+    category: simd
+    description: >
+      paddX/psubX/pmullX/pabsX/pminX/pmaxX translate to add/sub/mul/abs/
+      smin/smax/umin/umax with lane suffix (.16b/.8h/.4s/.2d). pmaddwd
+      requires multi-instruction sequence (smull+smlal2).
+    metadata:
+      match_rules:
+        - pattern: "\\bp(add|sub|mull|maddwd|abs|min|max)[bwdq]?[su]?b?\\b"
+          type: regex
+          scope: instruction
+          description: x64 SIMD integer arithmetic
+    x64_constructs:
+      - "paddb xmm0, xmm1"
+      - "paddw xmm0, xmm1"
+      - "paddd xmm0, xmm1"
+      - "paddq xmm0, xmm1"
+      - "pmullw xmm0, xmm1"
+      - "pmaddwd xmm0, xmm1"
+      - "pminub xmm0, xmm1"
+    arm64_constructs:
+      - "add v0.16b, v0.16b, v1.16b"
+      - "add v0.8h, v0.8h, v1.8h"
+      - "add v0.4s, v0.4s, v1.4s"
+      - "add v0.2d, v0.2d, v1.2d"
+      - "mul v0.8h, v0.8h, v1.8h"
+      - "smull v2.4s, v0.4h, v1.4h; smlal2 v2.4s, v0.8h, v1.8h"
+      - "umin v0.16b, v0.16b, v1.16b"
+    pitfalls:
+      - Lane suffix must match operation width; mismatching changes the operation entirely
+      - pmaddwd has no single-instruction NEON form
+    validation_criteria:
+      - All padd*/psub*/pmul* translate with correct lane suffix
+      - pmaddwd-class operations use multi-instruction sequences
+
+  - id: 4
+    name: simd-bitwise-with-pandn-swap
+    category: simd
+    description: >
+      pand/por/pxor become and/orr/eor on .16b. PANDN operand order
+      reverses: x64 `pandn xmm0, xmm1` (dst = NOT dst AND src) becomes
+      arm64 `bic v0.16b, v1.16b, v0.16b` (dst = src1 AND NOT src2).
+    metadata:
+      match_rules:
+        - pattern: "\\bp(and|or|xor|andn)\\b"
+          type: regex
+          scope: instruction
+          description: x64 SIMD bitwise instruction
+        - pattern: "\\bbic\\s+v\\d+\\.16b"
+          type: regex
+          scope: instruction
+          description: arm64 bit-clear (NOT-AND); used for PANDN translation
+    x64_constructs:
+      - "pand xmm0, xmm1"
+      - "por xmm0, xmm1"
+      - "pxor xmm0, xmm1"
+      - "pandn xmm0, xmm1"
+    arm64_constructs:
+      - "and v0.16b, v0.16b, v1.16b"
+      - "orr v0.16b, v0.16b, v1.16b"
+      - "eor v0.16b, v0.16b, v1.16b"
+      - "bic v0.16b, v1.16b, v0.16b   ; operand order swapped"
+    pitfalls:
+      - PANDN operand swap on bic is exact — naïve 1:1 mapping inverts the operation
+    validation_criteria:
+      - All pand*/por*/pxor* use .16b lane
+      - pandn translation has operands swapped from naive 1:1 mapping
+
+  - id: 5
+    name: simd-shift
+    category: simd
+    description: >
+      pslldX/psrlX/psraX immediate shifts become shl/ushr/sshr with lane
+      suffix. Variable shift uses ushl/sshl (negative count = right shift,
+      not wrap-around). No psraq (64-bit arithmetic right) on baseline NEON.
+    metadata:
+      match_rules:
+        - pattern: "\\bps[lr][lal][bwdq]?\\b"
+          type: regex
+          scope: instruction
+          description: x64 SIMD shift instruction
+    x64_constructs:
+      - "psllw xmm0, imm"
+      - "pslld xmm0, imm"
+      - "psllq xmm0, imm"
+      - "psrlw xmm0, imm"
+      - "psraw xmm0, imm"
+      - "pslld xmm0, xmm1   ; variable count"
+    arm64_constructs:
+      - "shl v0.8h, v0.8h, #imm"
+      - "shl v0.4s, v0.4s, #imm"
+      - "shl v0.2d, v0.2d, #imm"
+      - "ushr v0.8h, v0.8h, #imm"
+      - "sshr v0.8h, v0.8h, #imm"
+      - "ushl v0.4s, v0.4s, v1.4s   ; signed-count semantics"
+    pitfalls:
+      - Variable-shift NEON ushl/sshl interpret negative count as right shift, not wrap-around
+      - No psraq for 64-bit lanes; emulate via cmp+eor or sshr on sign-broadcast
+    validation_criteria:
+      - All immediate-count shifts have correct lane suffix and direction
+      - Variable shifts handle signed-count semantics correctly
+
+  - id: 6
+    name: simd-compare
+    category: simd
+    description: >
+      pcmpeqX → cmeq; pcmpgtX → cmgt (signed). Unsigned compare is cmhi (no
+      direct x64 equivalent — x64 typically used pmaxub + pcmpeq).
+    metadata:
+      match_rules:
+        - pattern: "\\bpcmp(eq|gt)[bwd]\\b"
+          type: regex
+          scope: instruction
+          description: x64 SIMD compare instruction
+    x64_constructs:
+      - "pcmpeqb xmm0, xmm1"
+      - "pcmpeqd xmm0, xmm1"
+      - "pcmpgtb xmm0, xmm1"
+    arm64_constructs:
+      - "cmeq v0.16b, v0.16b, v1.16b"
+      - "cmeq v0.4s, v0.4s, v1.4s"
+      - "cmgt v0.16b, v0.16b, v1.16b   ; signed"
+    pitfalls:
+      - x64 pcmpgt* is signed; for unsigned use cmhi (no x64 single-instruction equivalent)
+    validation_criteria:
+      - All pcmpeq* translate to cmeq with correct lane suffix
+      - pcmpgt* translate to cmgt; separately translated unsigned compares use cmhi
+
+  - id: 7
+    name: simd-shuffle-and-permute
+    category: simd
+    description: >
+      pshufb→tbl. punpcklXY→zip1; punpckhXY→zip2 with correct lane suffix.
+      palignr→ext with operand order reversed. pshufd general form requires
+      manual immediate-to-byte-index expansion + tbl.
+    metadata:
+      match_rules:
+        - pattern: "\\bp(shuf[bd]|unpck[lh][bwd]+|alignr)\\b"
+          type: regex
+          scope: instruction
+          description: x64 SIMD shuffle/permute/unpack
+        - pattern: "\\bvpbroadcast[bwdq]\\b"
+          type: regex
+          scope: instruction
+          description: AVX2 broadcast instruction
+    x64_constructs:
+      - "pshufb xmm0, xmm1"
+      - "pshufd xmm0, xmm0, 0    ; broadcast lane 0"
+      - "punpcklbw xmm0, xmm1"
+      - "punpckhbw xmm0, xmm1"
+      - "palignr xmm0, xmm1, imm"
+      - "vpbroadcastb ymm0, [mem]"
+    arm64_constructs:
+      - "tbl v0.16b, {v0.16b}, v1.16b"
+      - "dup v0.4s, v0.s[0]"
+      - "zip1 v0.16b, v0.16b, v1.16b"
+      - "zip2 v0.16b, v0.16b, v1.16b"
+      - "ext v0.16b, v1.16b, v0.16b, #imm   ; operand order reversed"
+      - "ld1r {v0.16b}, [x0]"
+    pitfalls:
+      - pshufd general imm has no single-instruction NEON form — expand to byte-index vector and tbl
+      - palignr operand order reverses on ext: x64 extracts from xmm1:xmm0; arm64 ext source pair is opposite order
+    validation_criteria:
+      - pshufb translates to tbl
+      - punpcklXY/punpckhXY translate to zip1/zip2 with correct lane suffix
+      - palignr translates to ext with operand order reversed
+
+  - id: 8
+    name: simd-no-direct-equivalent
+    category: simd
+    description: >
+      pmovmskb / vmovmskps have no NEON analog — restructure with addv
+      reductions or per-lane processing. AES-NI round structure differs
+      (aese + aesmc as separate instructions). YMM/ZMM operations split
+      into multiple 128-bit ops.
+    metadata:
+      match_rules:
+        - pattern: "\\b(pmovmskb|vmovmskp[sd])\\b"
+          type: regex
+          scope: instruction
+          description: x64 SIMD-to-GP movemask (no NEON analog)
+        - pattern: "\\b(aesenc|aesdec|aesimc|aeskeygenassist)\\b"
+          type: regex
+          scope: instruction
+          description: x64 AES-NI instruction
+        - pattern: "\\bpclmulqdq\\b"
+          type: regex
+          scope: instruction
+          description: x64 carry-less multiply
+    x64_constructs:
+      - "pmovmskb eax, xmm0"
+      - "vmovmskps eax, ymm0"
+      - "aesenc xmm0, xmm1"
+      - "pclmulqdq xmm0, xmm1, imm"
+    arm64_constructs:
+      - "umaxv b0, v1.16b   ; for any-nonzero test"
+      - "// restructure with cmlt + addp reductions"
+      - "aese v0.16b, v1.16b; aesmc v0.16b, v0.16b"
+      - "pmull v0.1q, v1.1d, v2.1d   ; or pmull2"
+    pitfalls:
+      - pmovmskb is the most common compatibility pain point; algorithmic rework usually required
+      - AES round structure differs: x64 aesenc does ShiftRows+SubBytes+MixColumns+AddRoundKey; arm64 aese does first three minus MixColumns, with aesmc separate
+    validation_criteria:
+      - No pmovmskb/vmovmskps in arm64 output
+      - AES sequences use paired aese + aesmc with correct round structure
+
+  - id: 9
+    name: inline-asm-neon-constraint
+    category: simd
+    description: >
+      arm64 inline asm for NEON values uses "=w" constraint (not "=r").
+      Operand template references (%0/%1) get lane suffix from instruction
+      template — no width modifier needed for NEON operands.
+    metadata:
+      match_rules:
+        - pattern: "asm\\s+(volatile\\s+)?\\([^\\)]*\"\\s*\\.16b|\\.8h|\\.4s|\\.2d"
+          type: regex
+          scope: expression
+          description: arm64 inline asm with NEON lane suffix
+        - pattern: ":\\s*\"=w\"\\("
+          type: regex
+          scope: expression
+          description: arm64 NEON output constraint
+    x64_constructs:
+      - 'asm ("paddb %0, %1" : "=x"(out) : "x"(a))'
+    arm64_constructs:
+      - 'asm ("add %0.16b, %1.16b, %2.16b" : "=w"(v) : "w"(a), "w"(b))'
+    pitfalls:
+      - Forgetting "=w" and using "=r" allocates a GP register; NEON instruction fails to assemble
+    validation_criteria:
+      - All inline-asm NEON outputs use "=w" constraint

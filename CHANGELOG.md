@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.1.0
+
+- **Refactor for token efficiency**: agent descriptions trimmed, instructions gated with `applyTo`, duplicated content extracted into on-demand skills and prompts. Idle-turn context drops from ~7.5K to ~1.4K tokens; full-pipeline context drops ~40–60%.
+- **New skills** (loaded on demand):
+  - `wos-neon-reference` — SSE/AVX → NEON tables, Windows ARM64 baseline ISA (AES/SHA1/SHA2/PMULL/CRC32), ARMv8.2+ optional features
+  - `wos-build-error-recipes` — C-series / LNK / D80xx / platform-config error triage
+  - `wos-forbidden-skip-reasons` — canonical forbidden vs valid skip-reason list + audit regex (used by wos-optimizer and Phase 8 gate G7c)
+  - `wos-toolchain-discovery` — MSVC ARM64 toolchain resolution with per-repo JSON cache
+  - `wos-woa-dashboard` — curated Windows on Arm Ecosystem Dashboard lookup for ~50 common C/C++, Rust, Node, Python, .NET packages with native/building/unsupported/unknown classification
+- **New per-build-system recipe instructions** (auto-loaded via `applyTo` on the matching manifest file): CMake, MSBuild, Cargo, Meson, node-gyp, Python C ext, plus a "misc" file for Autotools/Make/Bazel/GN/Premake/SCons/Waf/qmake/xmake/B2/Go
+- **New CI instruction** `wos-ci-arm64` — GitHub Actions `windows-11-arm`, AppVeyor, Azure Pipelines, GitLab, Jenkins recipes aligned with Arm AppReady
+- **New prompt** `wos-verify-port` — the Phase 8 semantic gate (G1–G8) extracted from the porter agent body
+- **wos-analyzer**: new heuristics for kernel-mode/driver code (`*.sys`, KMDF/WDM/NDIS/hypervisor), hardcoded arch checks across C/C++/Rust/Go/.NET/Node/Python, CI matrix arch gaps, `dumpbin` verification of prebuilt binaries, and Arm AppReady Assessment Summary in the report
+- **wos-porter**: Phase 8 report template now includes an `Arm AppReady Status` section (target profile, stages reached, dashboard status, runtime classification, App Assure escalation)
+- **Extension**: installs and registers agents / instructions / skills / prompts under `~/.copilot/{agents,instructions,skills,prompts}` and wires all four `chat.*Locations` settings
+- README: documents new asset categories and updated Claude Code setup covering all four folders
+
 ## 1.0.1
 
 - Fix: agent files are now removed from `~/.copilot/agents/` on extension uninstall (added the missing `uninstall.js` referenced by the `vscode:uninstall` hook)

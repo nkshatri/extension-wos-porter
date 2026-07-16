@@ -1,5 +1,5 @@
 ---
-description: "Port x64-specific source code to support ARM64. Use when: converting SIMD intrinsics SSE/AVX to NEON, porting inline assembly, adding ARM64 preprocessor guards, fixing architecture-specific code for aarch64 Windows."
+description: "Add ARM64 arch guards and scalar/NEON fallbacks to x64 source (SSE/AVX intrinsics, inline asm, x86 compiler intrinsics). Deep NEON kernel work is deferred to wos-optimizer."
 tools: [read, edit, search]
 user-invocable: false
 ---
@@ -48,6 +48,16 @@ Portable pattern for Windows:
 ```
 
 ## Porting Procedures
+
+**Skill-loading map** — load the most-specific applicable skill(s) on demand:
+
+| Situation | Load skill |
+|---|---|
+| Translating `_mm_*` / `_mm256_*` / `__m128i` / `__m256i` intrinsics to NEON | [sse-avx-to-neon](../skills/sse-avx-to-neon/SKILL.md) and/or [intrinsics-x64-to-arm64](../skills/intrinsics-x64-to-arm64/SKILL.md) |
+| Translating `asm volatile(...)` / MASM `.asm` files from x64 to AArch64 | [asm-x64-to-arm64](../skills/asm-x64-to-arm64/SKILL.md) |
+| Rewriting existing ARM64 `asm volatile(...)` blocks as intrinsics (MSVC compatibility) | [arm64-inlineasm-to-intrinsics](../skills/arm64-inlineasm-to-intrinsics/SKILL.md) |
+| Any freeform ARM64 code emission (no more specific pattern applies) | [arm64-baseline-porting](../skills/arm64-baseline-porting/SKILL.md) |
+| Windows ARM64 baseline ISA table / short SSE→NEON reference | [wos-neon-reference](../skills/wos-neon-reference/SKILL.md) |
 
 ### 1. SIMD Intrinsics — Hand-Written `<arm_neon.h>` Translation
 
@@ -157,6 +167,10 @@ For complex AVX code, provide a C scalar fallback if ARM NEON translation is non
 ---
 
 ### 2. Inline Assembly
+
+**Skill pointers:**
+- x64 inline asm or standalone MASM `.asm` file that needs an AArch64 counterpart → [asm-x64-to-arm64](../skills/asm-x64-to-arm64/SKILL.md)
+- Existing ARM64 inline asm (Clang/GCC-style `asm volatile(...)`) that needs to become MSVC-compatible intrinsics → [arm64-inlineasm-to-intrinsics](../skills/arm64-inlineasm-to-intrinsics/SKILL.md) (its `assets/Verification/` GoogleTest template MUST be used when translating)
 
 #### MSVC-style (`__asm { }`)
 

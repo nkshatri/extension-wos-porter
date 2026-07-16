@@ -1,9 +1,30 @@
+# VS Code / test scaffolding
 .vscode/**
 .vscode-test/**
+
+# Sources — the compiled JS in out/ is what ships
 src/**
 !out/**
+
+# Build-time only (verify-manifests runs at prepublish, not at runtime)
+scripts/**
+
+# Node dev tree
 node_modules/**
+package-lock.json
+
+# Repo hygiene / dev docs (not needed at runtime)
+.git/**
+.github/**
 .gitignore
+CODE-OF-CONDUCT.md
+CONTRIBUTING.md
+SECURITY.md
+
+# Build config
 tsconfig.json
 **/*.ts
 **/*.map
+
+# Packaged output artefacts
+*.vsix
