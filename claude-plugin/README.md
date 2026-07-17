@@ -88,6 +88,11 @@ Use this while developing, or when you have the repo checked out locally.
 
 ### Option C — Interactive menu
 
+
+https://github.com/user-attachments/assets/068e688f-3d6f-4fdf-a4e8-d026dce2ed82
+
+
+
 If you prefer the UI instead of typing commands, run:
 
 ```
