@@ -26,13 +26,13 @@ The target is always Windows ARM64; the host may be x64 (cross-compile) or ARM64
 
 There are three ways to install, depending on where the plugin lives. Pick one.
 
-### Option A — Interactive menu
+### Option A — Interactive menu (recommended)
 
 https://github.com/user-attachments/assets/068e688f-3d6f-4fdf-a4e8-d026dce2ed82
 
 
-
-If you prefer the UI instead of typing commands, run:
+**Using the VS Code UI**
+If you prefer using the UI instead of typing commands, install the Claude Code extension for Visual Studio Code, then open a new session and run:
 
 ```
 /plugin
@@ -63,7 +63,7 @@ Use this while developing, or when you have the repo checked out locally.
    /plugin install wos-porter@extension-wos-porter
    ```
 
-### Option C — Install from GitHub (recommended)
+### Option C — Install from GitHub
 
 
 This works once the repo (including the root `.claude-plugin/marketplace.json` and this `claude-plugin/` folder) is pushed to GitHub.
