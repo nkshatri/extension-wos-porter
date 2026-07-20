@@ -26,7 +26,45 @@ The target is always Windows ARM64; the host may be x64 (cross-compile) or ARM64
 
 There are three ways to install, depending on where the plugin lives. Pick one.
 
-### Option A — Install from GitHub (recommended)
+### Option A — Interactive menu
+
+https://github.com/user-attachments/assets/068e688f-3d6f-4fdf-a4e8-d026dce2ed82
+
+
+
+If you prefer the UI instead of typing commands, run:
+
+```
+/plugin
+```
+
+Then choose **Manage marketplaces → Add marketplace**, enter `qualcomm/extension-wos-porter` (or a local path), and install **wos-porter** from the browse list.
+
+
+### Option B — Install from a local clone
+
+Use this while developing, or when you have the repo checked out locally.
+
+1. Clone (or use your existing checkout):
+
+   ```
+   git clone https://github.com/qualcomm/extension-wos-porter.git
+   ```
+
+2. In Claude Code, add the local checkout as a marketplace (point at the repo root that contains `.claude-plugin/marketplace.json`):
+
+   ```
+   /plugin marketplace add C:\path\to\extension-wos-porter
+   ```
+
+3. Install:
+
+   ```
+   /plugin install wos-porter@extension-wos-porter
+   ```
+
+### Option C — Install from GitHub (recommended)
+
 
 This works once the repo (including the root `.claude-plugin/marketplace.json` and this `claude-plugin/` folder) is pushed to GitHub.
 
@@ -63,43 +101,6 @@ To update later, refresh the marketplace and reinstall:
 /plugin marketplace update extension-wos-porter
 /plugin install wos-porter@extension-wos-porter
 ```
-
-### Option B — Install from a local clone
-
-Use this while developing, or when you have the repo checked out locally.
-
-1. Clone (or use your existing checkout):
-
-   ```
-   git clone https://github.com/qualcomm/extension-wos-porter.git
-   ```
-
-2. In Claude Code, add the local checkout as a marketplace (point at the repo root that contains `.claude-plugin/marketplace.json`):
-
-   ```
-   /plugin marketplace add C:\path\to\extension-wos-porter
-   ```
-
-3. Install:
-
-   ```
-   /plugin install wos-porter@extension-wos-porter
-   ```
-
-### Option C — Interactive menu
-
-
-https://github.com/user-attachments/assets/068e688f-3d6f-4fdf-a4e8-d026dce2ed82
-
-
-
-If you prefer the UI instead of typing commands, run:
-
-```
-/plugin
-```
-
-Then choose **Manage marketplaces → Add marketplace**, enter `qualcomm/extension-wos-porter` (or a local path), and install **wos-porter** from the browse list.
 
 ## Usage
 
