@@ -6,8 +6,19 @@ name: WoS Port (Windows ARM64, Claude Code)
 # its marketplace.json at the repo root), so we load it headlessly with
 # `claude --plugin-dir` — no interactive `/plugin` marketplace/install step.
 #
-# Auth: requires a repo secret ANTHROPIC_API_KEY (a Claude API key). The
-# Claude CLI reads it from the environment in headless (`-p`) mode. See:
+# Auth (two supported modes):
+#   1. Direct Anthropic API — set repo secret ANTHROPIC_API_KEY (a Claude API
+#      key). Leave the anthropic_base_url input empty.
+#   2. LiteLLM (or any Anthropic-format LLM gateway) — set the anthropic_base_url
+#      input to your proxy URL and store the gateway credential in the repo
+#      secret LITELLM_API_KEY. LiteLLM authenticates with a Bearer token, so we
+#      pass it as ANTHROPIC_AUTH_TOKEN (Authorization: Bearer). The proxy must
+#      expose the Anthropic Messages API (/v1/messages), and claude_model must
+#      name a route your proxy serves. See:
+#      https://code.claude.com/docs/en/llm-gateway-connect
+#
+# The Claude CLI reads ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN / ANTHROPIC_BASE_URL
+# from the environment in headless (`-p`) mode — no CLI flag needed. See:
 # https://code.claude.com/docs/en/headless
 # https://code.claude.com/docs/en/cli-reference
 
@@ -19,10 +30,15 @@ on:
         required: true
         type: string
       claude_model:
-        description: "Claude model alias (sonnet, opus, haiku) or a full model id"
+        description: "Claude model alias (sonnet, opus, haiku), a full model id, or a LiteLLM route name"
         required: false
         type: string
         default: "sonnet"
+      anthropic_base_url:
+        description: "LLM-gateway base URL (e.g. https://your-litellm-host). Leave empty to use the direct Anthropic API."
+        required: false
+        type: string
+        default: ""
       max_turns:
         description: "Max agentic turns before Claude stops (headless --max-turns)"
         required: false
@@ -39,9 +55,14 @@ jobs:
     runs-on: windows-11-arm
     timeout-minutes: 360
     env:
-      # The Claude CLI reads ANTHROPIC_API_KEY from the environment for
-      # non-interactive auth. Store a Claude API key as a repo secret.
+      # Direct-API credential (used when anthropic_base_url is empty).
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      # Gateway routing + Bearer credential (used when anthropic_base_url is set).
+      # LiteLLM authenticates via Authorization: Bearer, which the CLI reads from
+      # ANTHROPIC_AUTH_TOKEN. Both are harmless to set unconditionally — the
+      # CLI ignores the ones that don't apply for the active mode.
+      ANTHROPIC_BASE_URL: ${{ github.event.inputs.anthropic_base_url }}
+      ANTHROPIC_AUTH_TOKEN: ${{ secrets.LITELLM_API_KEY }}
       WOS_REPO_URL: ${{ github.event.inputs.repo_url }}
       CLAUDE_MODEL: ${{ github.event.inputs.claude_model }}
       MAX_TURNS: ${{ github.event.inputs.max_turns }}
@@ -49,14 +70,31 @@ jobs:
       - name: Checkout extension (for the wos-porter Claude plugin)
         uses: actions/checkout@v4
 
-      - name: Verify ANTHROPIC_API_KEY is set
+      - name: Verify auth is configured (direct API or gateway)
         shell: pwsh
         run: |
-          if (-not $env:ANTHROPIC_API_KEY) {
-            Write-Error "ANTHROPIC_API_KEY secret is not configured on this repository. Create a Claude API key and store it as a repo secret named ANTHROPIC_API_KEY."
-            exit 1
+          if ($env:ANTHROPIC_BASE_URL) {
+            # Gateway mode (e.g. LiteLLM): need a Bearer credential.
+            Write-Host "Auth mode: LLM gateway -> $env:ANTHROPIC_BASE_URL"
+            if (-not $env:ANTHROPIC_AUTH_TOKEN) {
+              Write-Error "anthropic_base_url is set (gateway mode) but the LITELLM_API_KEY secret is empty. Store your LiteLLM/gateway Bearer credential as a repo secret named LITELLM_API_KEY."
+              exit 1
+            }
+            Write-Host "ANTHROPIC_AUTH_TOKEN present (length=$($env:ANTHROPIC_AUTH_TOKEN.Length)); ANTHROPIC_BASE_URL set."
+            # Avoid an auth-source conflict: in gateway mode the Bearer token is
+            # the credential, so drop any direct-API key that may also be set.
+            "ANTHROPIC_API_KEY=" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          } else {
+            # Direct Anthropic API mode.
+            Write-Host "Auth mode: direct Anthropic API"
+            if (-not $env:ANTHROPIC_API_KEY) {
+              Write-Error "No ANTHROPIC_BASE_URL was provided (direct-API mode) and the ANTHROPIC_API_KEY secret is empty. Either set ANTHROPIC_API_KEY, or provide anthropic_base_url + LITELLM_API_KEY for gateway mode."
+              exit 1
+            }
+            Write-Host "ANTHROPIC_API_KEY present (length=$($env:ANTHROPIC_API_KEY.Length))"
+            # Avoid an auth-source conflict: with no gateway, drop the unused Bearer token.
+            "ANTHROPIC_AUTH_TOKEN=" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           }
-          Write-Host "ANTHROPIC_API_KEY present (length=$($env:ANTHROPIC_API_KEY.Length))"
 
       - name: Set up Node.js (for Claude CLI + npm-based build systems)
         uses: actions/setup-node@v4
@@ -141,6 +179,7 @@ jobs:
 
           Write-Host "Prompt: $prompt"
           Write-Host "Model:  $env:CLAUDE_MODEL"
+          if ($env:ANTHROPIC_BASE_URL) { Write-Host "Gateway: $env:ANTHROPIC_BASE_URL" } else { Write-Host "Gateway: (none — direct Anthropic API)" }
           Write-Host "Plugin: ${{ steps.prep.outputs.plugin_dir }}"
 
           claude `
