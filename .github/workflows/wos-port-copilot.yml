@@ -94,19 +94,24 @@ jobs:
           Get-Command cmake, ninja, git, python -ErrorAction SilentlyContinue |
             Format-Table Name, Source
 
-      - name: Install wos-* agents and instructions into ~/.copilot
+      - name: Install wos-* agents, instructions, skills, and prompts into ~/.copilot
         shell: pwsh
         run: |
           $workRoot = "C:\src\wos-porter"
           New-Item -ItemType Directory -Force -Path $workRoot | Out-Null
 
-          # Copilot CLI's user-level custom agent location is ~/.copilot/agents/
-          # (same convention the VS Code extension uses in src/extension.ts).
+          # Copilot CLI's user-level custom asset locations mirror the VS Code
+          # extension's install targets in src/extension.ts:
+          #   ~/.copilot/agents, ~/.copilot/instructions, ~/.copilot/skills, ~/.copilot/prompts
           $userHome  = $env:USERPROFILE
           $agentsDst = Join-Path $userHome ".copilot\agents"
           $instrDst  = Join-Path $userHome ".copilot\instructions"
+          $skillsDst = Join-Path $userHome ".copilot\skills"
+          $promptsDst = Join-Path $userHome ".copilot\prompts"
           New-Item -ItemType Directory -Force -Path $agentsDst | Out-Null
           New-Item -ItemType Directory -Force -Path $instrDst  | Out-Null
+          New-Item -ItemType Directory -Force -Path $skillsDst | Out-Null
+          New-Item -ItemType Directory -Force -Path $promptsDst | Out-Null
 
           # Strip Copilot-incompatible frontmatter keys during install:
           #   - tools:            Claude-style tool names (execute, search, web,
@@ -142,14 +147,35 @@ jobs:
           Copy-Item "$env:GITHUB_WORKSPACE\instructions\*.instructions.md" `
             -Destination $instrDst -Force
 
+          # Skills: each is a directory containing a SKILL.md (plus assets).
+          # Copy the whole directory tree so referenced assets come along.
+          Get-ChildItem "$env:GITHUB_WORKSPACE\skills" -Directory | ForEach-Object {
+            $dst = Join-Path $skillsDst $_.Name
+            Copy-Item $_.FullName -Destination $dst -Recurse -Force
+            Write-Host "Installed skill: $dst"
+          }
+
+          # Prompts: flat *.prompt.md files.
+          if (Test-Path "$env:GITHUB_WORKSPACE\prompts") {
+            Copy-Item "$env:GITHUB_WORKSPACE\prompts\*.prompt.md" `
+              -Destination $promptsDst -Force -ErrorAction SilentlyContinue
+          }
+
           Write-Host "--- Installed agents ---"
           Get-ChildItem $agentsDst | Select-Object FullName
           Write-Host "--- Installed instructions ---"
           Get-ChildItem $instrDst | Select-Object FullName
+          Write-Host "--- Installed skills ---"
+          Get-ChildItem $skillsDst -Directory | Select-Object FullName
+          Write-Host "--- Installed prompts ---"
+          Get-ChildItem $promptsDst -ErrorAction SilentlyContinue | Select-Object FullName
 
           # Expose the instructions directory to Copilot CLI. Only
           # .github/instructions/ inside a repo is auto-discovered; for a
           # user-level directory we set COPILOT_CUSTOM_INSTRUCTIONS_DIRS.
+          # Skills (~/.copilot/skills) and agents (~/.copilot/agents) are picked
+          # up from those user-level dirs directly, the same way the agents in
+          # ~/.copilot/agents already load — no extra env var needed.
           "COPILOT_CUSTOM_INSTRUCTIONS_DIRS=$instrDst" |
             Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
