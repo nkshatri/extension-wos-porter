@@ -229,18 +229,66 @@ jobs:
         working-directory: ${{ steps.locate.outputs.ported_repo }}
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Continue'
           $outDir = "C:\src\wos-porter\_artifacts"
+          $seriesDir = Join-Path $outDir "patches"
           New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 
-          # Try to identify the base branch the porter branched from (default: main, fallback: master).
-          $base = 'main'
-          if (-not (git rev-parse --verify --quiet $base)) { $base = 'master' }
-          if (-not (git rev-parse --verify --quiet $base)) { $base = (git symbolic-ref --short HEAD) }
+          # The porter does all its work on the 'arm64-port' branch, forked from
+          # the repo's default branch. Confirm that branch exists first.
+          $port = 'arm64-port'
+          $portSha = (git rev-parse --verify --quiet "refs/heads/$port")
+          if (-not $portSha) {
+            Write-Warning "Branch '$port' not found — the porter never created it (likely failed before/at Phase 1). Capturing a working-tree diff instead so there's still something to inspect."
+            git status | Tee-Object (Join-Path $outDir "git-status.txt") | Out-Null
+            git diff --binary HEAD | Out-File -Encoding ascii (Join-Path $outDir "working-tree.diff")
+            exit 0
+          }
 
-          Write-Host "Base branch: $base"
-          git log --oneline "$base..arm64-port" 2>&1 | Tee-Object (Join-Path $outDir "commits.txt")
-          git diff --stat "$base..arm64-port"    2>&1 | Tee-Object (Join-Path $outDir "diffstat.txt")
-          git format-patch "$base..arm64-port" -o (Join-Path $outDir "patches") 2>&1 | Out-Null
+          # Resolve the BASE ref the port forked from. Must never be the port
+          # branch itself (that yields an empty patch — the classic bug). Try the
+          # usual defaults and the remote HEAD, excluding arm64-port.
+          $base = $null
+          foreach ($cand in @('main','master','origin/main','origin/master','origin/HEAD')) {
+            if ($cand -eq $port) { continue }
+            $sha = (git rev-parse --verify --quiet $cand)
+            if ($sha) { $base = $cand; break }
+          }
+          if (-not $base) {
+            Write-Warning "Could not resolve a base branch (main/master/origin). Falling back to the parent of the first arm64-port commit."
+            $base = (git rev-list --max-parents=0 "$port" | Select-Object -Last 1)  # root commit
+          }
+
+          # Use the true fork point so the patch contains ONLY the porter's work,
+          # not unrelated commits that landed on the base after the fork.
+          $forkPoint = (git merge-base $base $port).Trim()
+          if (-not $forkPoint) { $forkPoint = $base }
+          Write-Host "Base ref: $base   fork point: $forkPoint   port tip: $portSha"
+
+          $range = "$forkPoint..$port"
+          $commitCount = [int](git rev-list --count $range)
+          Write-Host "Commits on $port since fork: $commitCount"
+
+          git log --oneline $range | Tee-Object (Join-Path $outDir "commits.txt")
+          git diff --stat $range   | Tee-Object (Join-Path $outDir "diffstat.txt")
+
+          if ($commitCount -eq 0) {
+            Write-Warning "No commits on '$port' beyond the base — nothing to turn into a patch. The porter may have applied changes but never committed them; capturing the working-tree diff as a fallback."
+            git diff --binary $range | Out-File -Encoding ascii (Join-Path $outDir "arm64-port.diff")
+            git diff --binary HEAD   | Out-File -Encoding ascii (Join-Path $outDir "working-tree.diff")
+          } else {
+            # Two artifacts: a single combined diff (git apply) and the per-commit
+            # mbox series (git am). Write the combined patch with .NET so PS 5.1
+            # doesn't inject a UTF-8 BOM that breaks `git apply`.
+            $combined = Join-Path $outDir "arm64-port.patch"
+            $diffText = (git diff --binary $range | Out-String)
+            [System.IO.File]::WriteAllText($combined, $diffText, (New-Object System.Text.UTF8Encoding($false)))
+            Write-Host "Wrote combined patch: $combined"
+
+            New-Item -ItemType Directory -Force -Path $seriesDir | Out-Null
+            $series = git format-patch $range -o $seriesDir
+            Write-Host "Wrote $($series.Count) per-commit patch file(s) to $seriesDir"
+          }
 
           if (Test-Path "ARM64-PORT.md") {
             Copy-Item "ARM64-PORT.md" (Join-Path $outDir "ARM64-PORT.md") -Force
