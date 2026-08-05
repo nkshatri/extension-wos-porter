@@ -151,7 +151,7 @@ using the [GitHub Copilot CLI](https://docs.github.com/en/copilot/reference/copi
 backend. Give it a repository URL and it clones, analyzes, ports, builds, and
 uploads a ready-to-apply patch as a workflow artifact.
 
-> There is also a Claude Code counterpart,
+> Disclaimer: (Still in development phase)There is also a Claude Code counterpart,
 > [`.github/workflows/wos-port-claude.yml`](.github/workflows/wos-port-claude.yml),
 > which runs the same pipeline via the Claude Code plugin. Use whichever backend
 > you have credentials for — the inputs and artifacts are the same.
