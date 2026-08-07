@@ -9,7 +9,7 @@
 
 ## Install from VSIX (Releases)
 
-1. Download the latest `.vsix` from the [Releases page](https://github.com/pdeep854/extension-wos-porter/releases)
+1. Download the latest `.vsix` from the [Releases page](https://github.com/qualcomm/extension-wos-porter/releases)
 2. In VS Code, open the Extensions view (`Ctrl+Shift+X`) → click the `...` menu → select **"Install from VSIX..."** → choose the downloaded file
 3. Reload VS Code when prompted
 
@@ -19,7 +19,7 @@ If you want to build and install from source:
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/pdeep854/extension-wos-porter.git
+   git clone https://github.com/qualcomm/extension-wos-porter.git
    cd extension-wos-porter
    ```
 
@@ -40,13 +40,19 @@ If you want to build and install from source:
 
 1. Open Copilot Chat
 2. Select the **wos-porter** agent from the agent picker
-3. Paste a GitHub repository URL:
+3. Paste a GitHub repository URL or a local path to an x64 project:
 
 ```
 Port https://github.com/user/repo to ARM64
 ```
 
-The agent will clone the repo, analyze it, port it, build it, and produce a patch — all automatically.
+or
+
+```
+Port C:\src\my-x64-project to ARM64
+```
+
+The agent will analyze it, port it, build it, and produce a patch — all automatically.
 
 ### Other agents
 
