@@ -74,6 +74,13 @@ Write-Host "vcvars:   $vcvarsPath"
 # Persist for reuse across phases / sub-agents
 $stateDir  = Join-Path $repoPath '.copilot\state'
 New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
+# Ensure the agent's scratch state never dirties the working tree (Phase 8 G8 clean-tree gate)
+# nor gets committed. Covers wos-toolchain.json, wos-deps.json, wos-milestones.json,
+# optimizer-deferred.json, and any future .copilot state.
+$gi = Join-Path $repoPath '.gitignore'
+if (-not (Test-Path $gi) -or -not (Select-String -Path $gi -SimpleMatch '.copilot/' -Quiet)) {
+    Add-Content -Path $gi -Value "`n# wos-porter agent scratch state (not part of the port)`n.copilot/"
+}
 [pscustomobject]@{
     hostArch = $hostArch; vsPath = $vsPath
     cl = $cl; msbuild = $msbuild; dumpbin = $dumpbin
