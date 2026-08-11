@@ -17,6 +17,7 @@ const AGENT_FILES = [
     'wos-builder.agent.md',
     'wos-tester.agent.md',
     'wos-optimizer.agent.md',
+    'x64-benchmarker.agent.md',
 ];
 
 const INSTRUCTION_FILES = [
