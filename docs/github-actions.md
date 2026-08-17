@@ -1,16 +1,18 @@
 # Run in the Cloud (GitHub Actions)
 
-You don't need a local ARM64 machine. The repo ships a workflow —
-[`.github/workflows/wos-port-copilot.yml`](../.github/workflows/wos-port-copilot.yml) —
-that runs the full porting pipeline on a GitHub-hosted **`windows-11-arm`** runner
-using the [GitHub Copilot CLI](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-command-reference)
-backend. Give it a repository URL and it clones, analyzes, ports, builds, and
-uploads a ready-to-apply patch as a workflow artifact.
+> **Recommended:** Cloud deployment via GitHub Actions is still evolving. For best porting results, run the agent locally using the **GitHub Copilot VS Code extension** or the **Claude Code plugin** — local runs give full interactive visibility and the ability to intervene when needed. Use the workflows below when you don't have a local ARM64 machine or want an automated, unattended run.
 
-> There is also a Claude Code counterpart,
-> [`.github/workflows/wos-port-claude.yml`](../.github/workflows/wos-port-claude.yml),
-> which runs the same pipeline via the Claude Code plugin. Use whichever backend
-> you have credentials for — the inputs and artifacts are the same.
+Three workflow variants are available — pick the one that matches your credentials:
+
+| Workflow | Best for |
+|---|---|
+| **[WoS Port — Copilot](../.github/workflows/wos-port-copilot.yml)** | Simplest setup; requires a `COPILOT_GITHUB_TOKEN` secret |
+| **[WoS Port — Copilot with x64 baseline](../.github/workflows/wos-port-copilot-x64-arm64.yml)** | Runs an x64 benchmark first, then uses it to guide ARM64 NEON optimizations |
+| **[WoS Port — Claude Code](../.github/workflows/wos-port-claude.yml)** | Uses the Anthropic Claude Code backend; requires an `ANTHROPIC_API_KEY` secret |
+
+All three run on a GitHub-hosted **`windows-11-arm`** runner with the preinstalled Visual Studio ARM64 toolchain. Give any of them a repository URL and they clone, analyze, port, build, and upload a ready-to-apply patch as a workflow artifact.
+
+> **Note:** The Claude Code workflow (`wos-port-claude.yml`) is still in development and may require additional checks and improvements before use in production. For a more stable cloud experience, prefer the Copilot workflows.
 
 ## 1. Configure the Copilot token (one-time)
 
