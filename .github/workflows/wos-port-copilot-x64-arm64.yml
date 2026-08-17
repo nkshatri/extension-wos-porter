@@ -238,7 +238,7 @@ jobs:
       #       results\ subdirectory, so a wildcard on the whole directory is safer.
       - name: Upload x64 benchmark results
         if: always() && steps.stage.outputs.bench_dir != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: x64-benchmark-${{ steps.stage.outputs.repo_name }}
           path: ${{ steps.stage.outputs.bench_dir }}\**
@@ -586,7 +586,7 @@ jobs:
 
       - name: Upload run log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: copilot-run-log
           path: C:\src\wos-porter\_logs\**
@@ -594,7 +594,7 @@ jobs:
 
       - name: Upload ARM64 port artifacts (patch + report)
         if: always() && steps.clone.outputs.repo_dir != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: arm64-port-copilot-${{ steps.clone.outputs.repo_name }}
           path: C:\src\wos-porter\_artifacts\**
@@ -602,7 +602,7 @@ jobs:
 
       - name: Upload full ported working tree (branch arm64-port)
         if: always() && steps.clone.outputs.repo_dir != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ported-repo-copilot-${{ steps.clone.outputs.repo_name }}
           path: |
