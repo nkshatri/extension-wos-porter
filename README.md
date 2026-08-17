@@ -23,6 +23,8 @@ Give it a GitHub repository URL or a local path to an x64 project and it will:
 
 ## Get Started
 
+> **Recommended approach:** Run the agent locally using the **GitHub Copilot VS Code extension** or the **Claude Code plugin** — local runs give you full visibility and the ability to intervene when needed.  For best porting results — whether running locally or in the cloud — use a **Claude Sonnet or Opus** model.  Cloud (GitHub Actions) workflows are also available but are still evolving and may need extra checks.
+
 - **[GitHub Copilot (VS Code Extension)](docs/copilot-installation.md)** — Install VSIX, open Copilot Chat, and start porting
 - **[Claude Code (Plugin)](claude-plugin/README.md)** — Install and run as a Claude Code plugin
 - **[Run in the Cloud (GitHub Actions)](docs/github-actions.md)** — No local ARM64 machine needed; runs on `windows-11-arm` runners

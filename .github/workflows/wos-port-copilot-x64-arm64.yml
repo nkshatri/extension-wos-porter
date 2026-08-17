@@ -1,18 +1,17 @@
 name: WoS Port with x64 Benchmark (Copilot CLI, x64 → ARM64)
 
 # Two-job pipeline:
-#   job1 (x64-benchmark): Runs on a Windows x64 runner. Invokes the
-#     x64-benchmarker Copilot agent to build the target repo for x64,
-#     run all tests and benchmarks, and upload the x64_benchmark/ result
-#     as a workflow artifact.
-#   job2 (arm64-port): Runs on a Windows ARM64 runner. Downloads the
-#     x64 benchmark artifact from job1, then invokes the wos-porter
-#     Copilot agent passing the repo URL and the local x64_benchmark
-#     result path so the optimizer can close performance gaps. Uploads
-#     all ARM64 port patches and the run log as artifacts.
+#   Job 1 — x64-benchmark  : runs x64-benchmarker agent on a Windows x64 runner.
+#            Clones the target repo, builds for x64, discovers/generates benchmarks,
+#            runs them, and uploads the x64_benchmark/ directory as a workflow artifact.
+#   Job 2 — arm64-port     : runs wos-porter agent on a Windows ARM64 runner.
+#            Downloads the x64 benchmark artifact, places it beside the freshly-cloned
+#            repo, and passes its location to the wos-porter prompt so the ARM64
+#            benchmark phase can compare against the x64 baseline.
 #
-# Auth: requires a repo secret COPILOT_GITHUB_TOKEN containing a
-# fine-grained PAT (v2) with the "Copilot Requests" permission.
+# Auth: requires a repo secret COPILOT_GITHUB_TOKEN containing a fine-grained PAT
+# (v2) with the "Copilot Requests" permission.  The built-in ${{ secrets.GITHUB_TOKEN }}
+# does not carry that scope and cannot be used here.
 
 on:
   workflow_dispatch:
@@ -27,44 +26,46 @@ on:
         type: string
         default: "auto"
       max_autopilot_continues:
-        description: "Max autopilot continuation messages before the CLI stops"
+        description: "Max autopilot continuation messages (analog of Claude --max-turns)"
         required: false
         type: string
         default: "400"
 
 concurrency:
-  group: wos-port-copilot-x64-arm64-${{ github.event.inputs.repo_url }}
+  group: wos-port-copilot-${{ github.event.inputs.repo_url }}
   cancel-in-progress: false
 
 # ─────────────────────────────────────────────────────────────────────────────
-# JOB 1 — x64 benchmark (Windows x64 runner)
+# Job 1: x64 build + benchmark
 # ─────────────────────────────────────────────────────────────────────────────
 jobs:
   x64-benchmark:
-    name: x64 Benchmark – ${{ github.event.inputs.repo_url }}
-    runs-on: windows-latest          # standard x64 Windows runner
-    timeout-minutes: 180
+    name: "x64 — Build & Benchmark"
+    runs-on: windows-latest
+    timeout-minutes: 120
     env:
       COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
       COPILOT_ALLOW_ALL: "true"
       WOS_REPO_URL: ${{ github.event.inputs.repo_url }}
       COPILOT_MODEL: ${{ github.event.inputs.copilot_model }}
       MAX_AUTOPILOT_CONTINUES: ${{ github.event.inputs.max_autopilot_continues }}
-      X64_BENCH_WORKDIR: C:\src\x64-bench
 
     steps:
-      - name: Checkout extension (for agent + skill sources)
+      # ── 1. Source: check out this extension repo (agents + skills live here) ──
+      - name: Checkout extension repo
         uses: actions/checkout@v4
 
-      - name: Verify COPILOT_GITHUB_TOKEN is set
+      # ── 2. Guard: token must be present ──
+      - name: Verify COPILOT_GITHUB_TOKEN
         shell: pwsh
         run: |
           if (-not $env:COPILOT_GITHUB_TOKEN) {
-            Write-Error "COPILOT_GITHUB_TOKEN secret is not configured. Create a fine-grained PAT with the 'Copilot Requests' permission and store it as COPILOT_GITHUB_TOKEN."
+            Write-Error "COPILOT_GITHUB_TOKEN secret is missing. Add a fine-grained PAT with 'Copilot Requests' permission."
             exit 1
           }
-          Write-Host "COPILOT_GITHUB_TOKEN present (length=$($env:COPILOT_GITHUB_TOKEN.Length))"
+          Write-Host "Token present (length=$($env:COPILOT_GITHUB_TOKEN.Length))"
 
+      # ── 3. Runtime: Node + Copilot CLI ──
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
@@ -76,65 +77,108 @@ jobs:
           npm install -g @github/copilot
           copilot --version
 
-      - name: Install wos-* agents, skills, instructions, and prompts into ~/.copilot
+      # ── 4. Info: show what build tools are available ──
+      - name: Show x64 toolchain
         shell: pwsh
         run: |
-          $userHome  = $env:USERPROFILE
-          $agentsDst = Join-Path $userHome ".copilot\agents"
-          $instrDst  = Join-Path $userHome ".copilot\instructions"
-          $skillsDst = Join-Path $userHome ".copilot\skills"
-          $promptsDst = Join-Path $userHome ".copilot\prompts"
-          New-Item -ItemType Directory -Force -Path $agentsDst, $instrDst, $skillsDst, $promptsDst | Out-Null
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (Test-Path $vswhere) {
+            $vsPath = & $vswhere -latest -property installationPath
+            Write-Host "VS: $vsPath"
+            $cl = Get-ChildItem "$vsPath\VC\Tools\MSVC" -Recurse -Filter cl.exe |
+                  Where-Object { $_.FullName -match 'Hostx64\\x64' } |
+                  Select-Object -First 1 -ExpandProperty FullName
+            Write-Host "cl.exe (x64): $cl"
+          }
+          Get-Command cmake, ninja, git, python, cargo, go, msbuild `
+            -ErrorAction SilentlyContinue | Format-Table Name, Source
 
-          # Strip Copilot-incompatible frontmatter keys (tools, agents,
-          # argument-hint, user-invocable) during install.
-          Get-ChildItem "$env:GITHUB_WORKSPACE\agents\x64-benchmarker.agent.md" |
-            ForEach-Object {
-              $srcPath = $_.FullName
-              $dstPath = Join-Path $agentsDst $_.Name
-              $raw = Get-Content -Raw -LiteralPath $srcPath
-              if ($raw -notmatch '(?s)^---\r?\n(.*?)\r?\n---\r?\n(.*)$') {
-                Write-Error "No YAML frontmatter in $srcPath"; exit 1
-              }
-              $fmLines = ($Matches[1] -split "`r?`n") | Where-Object {
-                $_ -notmatch '^\s*(tools|agents|argument-hint|user-invocable)\s*:'
-              }
-              $out = "---`n$(($fmLines -join "`n").Trim())`n---`n$($Matches[2])"
-              Set-Content -LiteralPath $dstPath -Value $out -Encoding UTF8
-              Write-Host "Installed agent: $dstPath"
-            }
+      # ── 5. Install all agents + skills from this repo into ~/.copilot ──
+      #       and export the dirs Copilot CLI needs to discover them.
+      - name: Install agents and skills into ~/.copilot
+        shell: pwsh
+        run: |
+          $home_     = $env:USERPROFILE
+          $agentsDst = Join-Path $home_ ".copilot\agents"
+          $skillsDst = Join-Path $home_ ".copilot\skills"
+          $instrDst  = Join-Path $home_ ".copilot\instructions"
+          $promptsDst= Join-Path $home_ ".copilot\prompts"
 
-          Copy-Item "$env:GITHUB_WORKSPACE\instructions\*.instructions.md" `
-            -Destination $instrDst -Force
+          foreach ($d in @($agentsDst, $skillsDst, $instrDst, $promptsDst)) {
+            New-Item -ItemType Directory -Force -Path $d | Out-Null
+          }
 
+          # Copy only x64-benchmarker — do NOT install wos-* agents here.
+          # Installing all agents risks the CLI picking up wos-porter and running
+          # ARM64 porting work on the x64 runner.
+          $agentSrc = Join-Path $env:GITHUB_WORKSPACE "agents\x64-benchmarker.agent.md"
+          $raw = Get-Content -Raw -LiteralPath $agentSrc
+          if ($raw -notmatch '(?s)^---\r?\n(.*?)\r?\n---\r?\n(.*)$') {
+            Write-Error "No frontmatter: $agentSrc"; exit 1
+          }
+          $fm = ($Matches[1] -split "`r?`n") |
+                Where-Object { $_ -notmatch '^\s*(argument-hint|user-invocable)\s*:' }
+          $out = "---`n$(($fm -join "`n").Trim())`n---`n$($Matches[2])"
+          $dst = Join-Path $agentsDst "x64-benchmarker.agent.md"
+          Set-Content -LiteralPath $dst -Value $out -Encoding UTF8
+          Write-Host "agent  -> $dst"
+
+          # Skills (each is a subdirectory with SKILL.md)
           Get-ChildItem "$env:GITHUB_WORKSPACE\skills" -Directory | ForEach-Object {
             $dst = Join-Path $skillsDst $_.Name
             Copy-Item $_.FullName -Destination $dst -Recurse -Force
-            Write-Host "Installed skill: $dst"
+            Write-Host "skill  -> $dst"
           }
 
+          # Instructions
+          Get-ChildItem "$env:GITHUB_WORKSPACE\instructions\*.instructions.md" |
+            ForEach-Object {
+              Copy-Item $_.FullName -Destination $instrDst -Force
+              Write-Host "instr  -> $(Join-Path $instrDst $_.Name)"
+            }
+
+          # Prompts (optional)
           if (Test-Path "$env:GITHUB_WORKSPACE\prompts") {
-            Copy-Item "$env:GITHUB_WORKSPACE\prompts\*.prompt.md" `
-              -Destination $promptsDst -Force -ErrorAction SilentlyContinue
+            Get-ChildItem "$env:GITHUB_WORKSPACE\prompts\*.prompt.md" -ErrorAction SilentlyContinue |
+              ForEach-Object { Copy-Item $_.FullName -Destination $promptsDst -Force }
           }
 
-          "COPILOT_CUSTOM_INSTRUCTIONS_DIRS=$instrDst" |
-            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          # Export so every subsequent step (and the copilot process) can find them.
+          "COPILOT_AGENTS_DIRS=$agentsDst"             | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "COPILOT_SKILLS_DIRS=$skillsDst"             | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "COPILOT_CUSTOM_INSTRUCTIONS_DIRS=$instrDst" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Run x64-benchmarker agent (Copilot CLI)
+          Write-Host ""
+          Write-Host "=== Agents installed ==="
+          Get-ChildItem $agentsDst | Select-Object -ExpandProperty Name
+          Write-Host "=== Skills installed ==="
+          Get-ChildItem $skillsDst -Directory | Select-Object -ExpandProperty Name
+
+      # ── 6. Create work directory (must exist before working-directory: is used) ──
+      - name: Create work directory
         shell: pwsh
-        run: |
-          # Continue throughout: do NOT use 2>&1 — in PowerShell 5.1, redirecting
-          # stderr from a native command wraps each line in an ErrorRecord, which
-          # would terminate the script on the first copilot log line. The runner
-          # captures stderr separately without needing the redirect.
-          $ErrorActionPreference = 'Continue'
-          $logDir = "C:\src\x64-bench\_logs"
-          New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+        run: New-Item -ItemType Directory -Force -Path "C:\src\x64-bench" | Out-Null
 
-          $prompt = "Build and benchmark this repository for x64: $env:WOS_REPO_URL"
-          Write-Host "Prompt: $prompt"
-          Write-Host "Model:  $env:COPILOT_MODEL"
+      # ── 7. Run x64-benchmarker agent ──
+      #       The agent receives only the GitHub link. It handles everything:
+      #       clone → build x64 → run tests → run/generate benchmarks → write results.
+      #       All output lands in <repo>\x64_benchmark\ inside C:\src\x64-bench\.
+      - name: Run x64-benchmarker
+        working-directory: C:\src\x64-bench
+        shell: pwsh
+        env:
+          X64_BENCH_WORKDIR: C:\src\x64-bench
+          COPILOT_TASK_WAIT_TIMEOUT_SECONDS: "6600"   # wait up to 110 min (job limit 120)
+        run: |
+          Write-Host "Repo : $env:WOS_REPO_URL"
+          Write-Host "Model: $env:COPILOT_MODEL"
+          Write-Host "Workdir: C:\src\x64-bench"
+
+          $prompt = "Clone $env:WOS_REPO_URL into C:\src\x64-bench. " +
+                    "Build it for x64 Release. " +
+                    "Run all tests and benchmarks. " +
+                    "If no benchmarks exist, write a benchmark, build it, and run it. " +
+                    "Save all benchmark results and any generated benchmark source file under x64_benchmark\ inside the cloned repo."
 
           copilot `
             -p $prompt `
@@ -144,119 +188,73 @@ jobs:
             --max-autopilot-continues ([int]$env:MAX_AUTOPILOT_CONTINUES) `
             --allow-all-tools `
             --allow-all-paths `
-            --allow-all-urls `
-            --output-format=json `
-            --log-dir=$logDir `
-            --log-level=info |
-            Tee-Object -FilePath (Join-Path $logDir "copilot-x64-run.jsonl")
+            --allow-all-urls
 
-          # $? is false if copilot was not found (CommandNotFoundException);
-          # $LASTEXITCODE is non-zero if copilot ran but exited with an error.
-          if (-not $? -or $LASTEXITCODE -ne 0) {
-            Write-Warning "copilot x64-benchmarker exited with code $LASTEXITCODE (command found: $?) — artifacts will still be uploaded."
-          }
+          Write-Host "Exit code: $LASTEXITCODE"
 
-      - name: Locate x64_benchmark output directory
-        id: locate_bench
+      # ── 8. Dump work directory tree so failures are diagnosable ──
+      - name: Dump work directory tree
         if: always()
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Continue'
-          # The x64-benchmarker agent writes all artifacts under:
-          #   <workRoot>/<repoName>/x64_benchmark/
-          # Exact files produced per phase:
-          #   Phase 2: targets.txt
-          #   Phase 3: build.log
-          #   Phase 4: test_results.log
-          #   Phase 6: results/base_bench_x64.<ext>          (JSON/CSV/XML/TXT/HTML)
-          #            results/base_bench_x64/               (Criterion multi-file)
-          #            results/base_bench_x64.meta.json      (CPU/OS/toolchain metadata)
-          #            generated_bench.<ext>                 (auto-generated source, if 6B)
-          #            bench_build.log                       (benchmark build log, if 6B)
-          #   Phase 7: REPORT.md                             (written last — may be absent on timeout)
-          #
-          # We locate x64_benchmark/ and upload the whole tree. Phase 6 results
-          # are the primary payload; REPORT.md is a nice-to-have summary only.
-          $workRoot = $env:X64_BENCH_WORKDIR
-          $repoName = ($env:WOS_REPO_URL -split '/')[-1] -replace '\.git$',''
-          $benchDir = Join-Path $workRoot "$repoName\x64_benchmark"
+          Write-Host "=== C:\src\x64-bench tree ==="
+          Get-ChildItem -Recurse "C:\src\x64-bench" -ErrorAction SilentlyContinue |
+            Select-Object FullName | Format-Table -AutoSize
 
-          if (-not (Test-Path $benchDir)) {
-            Write-Warning "Expected x64_benchmark dir not found at $benchDir — falling back to full workdir search."
-            $found = Get-ChildItem $workRoot -Recurse -Directory -Filter x64_benchmark `
-                       -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($found) {
-              $benchDir = $found.FullName
-              Write-Host "Found x64_benchmark at $benchDir"
-            } else {
-              Write-Warning "No x64_benchmark directory found under $workRoot — benchmark agent did not complete Phase 2."
-              "bench_dir="      | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-              "repo_name=$repoName" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-              exit 0
-            }
-          }
-
-          "bench_dir=$benchDir" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          "repo_name=$repoName"  | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-
-          # Enumerate every artifact file produced, grouped by phase.
-          Write-Host "`n=== x64_benchmark artifact inventory ==="
-          $knownFiles = @(
-            "targets.txt",          # Phase 2
-            "build.log",            # Phase 3
-            "test_results.log",     # Phase 4
-            "bench_build.log",      # Phase 6B
-            "REPORT.md"             # Phase 7
-          )
-          foreach ($f in $knownFiles) {
-            $p = Join-Path $benchDir $f
-            if (Test-Path $p) { Write-Host "  [present] $f" }
-            else               { Write-Host "  [absent]  $f" }
-          }
-          # Phase 6 result files (variable extension/layout)
-          $resultsDir = Join-Path $benchDir "results"
-          if (Test-Path $resultsDir) {
-            $resultFiles = Get-ChildItem $resultsDir -Recurse -File -ErrorAction SilentlyContinue
-            if ($resultFiles) {
-              Write-Host "  [present] results/ ($($resultFiles.Count) file(s)):"
-              $resultFiles | ForEach-Object { Write-Host "    $($_.Name)" }
-            } else {
-              Write-Host "  [absent]  results/ (dir exists but empty — Phase 6 did not complete)"
-            }
-          } else {
-            Write-Host "  [absent]  results/ — Phase 6 did not run"
-          }
-          # Auto-generated benchmark source (Phase 6B, variable extension)
-          $genBench = Get-ChildItem $benchDir -File -Filter "generated_bench.*" -ErrorAction SilentlyContinue
-          if ($genBench) { Write-Host "  [present] $($genBench.Name) (auto-generated benchmark source)" }
-          Write-Host "========================================`n"
-
-      - name: Upload x64 benchmark results
-        if: always() && steps.locate_bench.outputs.bench_dir != ''
-        uses: actions/upload-artifact@v4
-        with:
-          name: x64-benchmark-${{ steps.locate_bench.outputs.repo_name }}
-          path: ${{ steps.locate_bench.outputs.bench_dir }}/**
-          if-no-files-found: warn
-
-      - name: Upload x64 benchmarker run log
+      # ── 9. Locate benchmark output written by the agent ──
+      - name: Locate benchmark results
+        id: stage
         if: always()
+        shell: pwsh
+        run: |
+          $workRoot = "C:\src\x64-bench"
+
+          $repo = Get-ChildItem -Directory $workRoot -ErrorAction SilentlyContinue |
+                  Where-Object { Test-Path (Join-Path $_.FullName ".git") } |
+                  Select-Object -First 1
+
+          if (-not $repo) {
+            Write-Warning "No cloned repo found under $workRoot — agent did not complete Phase 1."
+            "repo_name=unknown" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            "bench_dir="        | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            exit 0
+          }
+
+          "repo_name=$($repo.Name)" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+          $benchDir = Join-Path $repo.FullName "x64_benchmark"
+          if (Test-Path $benchDir) {
+            "bench_dir=$benchDir" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            Write-Host "Benchmark dir: $benchDir"
+            Get-ChildItem -Recurse $benchDir | Select-Object FullName | Format-Table -AutoSize
+          } else {
+            Write-Warning "x64_benchmark\ not found — agent did not complete benchmarking phases."
+            "bench_dir=" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          }
+
+      # ── 9. Upload benchmark results + generated benchmark file (if any) ──
+      #       Upload everything under x64_benchmark\ — the agent may write files
+      #       directly there (REPORT.md, build.log, *.txt) rather than under a
+      #       results\ subdirectory, so a wildcard on the whole directory is safer.
+      - name: Upload x64 benchmark results
+        if: always() && steps.stage.outputs.bench_dir != ''
         uses: actions/upload-artifact@v4
         with:
-          name: x64-benchmarker-log-${{ steps.locate_bench.outputs.repo_name }}
-          path: C:\src\x64-bench\_logs\**
+          name: x64-benchmark-${{ steps.stage.outputs.repo_name }}
+          path: ${{ steps.stage.outputs.bench_dir }}\**
           if-no-files-found: warn
 
 # ─────────────────────────────────────────────────────────────────────────────
-# JOB 2 — ARM64 port (Windows ARM64 runner)
+# Job 2: ARM64 port + optimize (receives x64 benchmark results from Job 1)
+# Based on the working single-job wos-port-copilot reference script.
+# Only addition: download x64 benchmark artifact from Job 1 and pass its
+# path to wos-porter so Phase 7 can run the differential optimizer.
 # ─────────────────────────────────────────────────────────────────────────────
   arm64-port:
-    name: ARM64 Port – ${{ github.event.inputs.repo_url }}
-    runs-on: windows-11-arm
+    name: "ARM64 — Port & Optimize"
     needs: x64-benchmark
-    # Run if job1 succeeded or failed — but NOT if it was cancelled, to avoid
-    # spinning up a 6-hour ARM64 runner after a manual workflow cancellation.
-    if: needs.x64-benchmark.result != 'cancelled'
+    if: always()
+    runs-on: windows-11-arm
     timeout-minutes: 360
     env:
       COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
@@ -266,19 +264,19 @@ jobs:
       MAX_AUTOPILOT_CONTINUES: ${{ github.event.inputs.max_autopilot_continues }}
 
     steps:
-      - name: Checkout extension (for agent + skill sources)
+      - name: Checkout extension (for agent + instruction sources)
         uses: actions/checkout@v4
 
       - name: Verify COPILOT_GITHUB_TOKEN is set
         shell: pwsh
         run: |
           if (-not $env:COPILOT_GITHUB_TOKEN) {
-            Write-Error "COPILOT_GITHUB_TOKEN secret is not configured. Create a fine-grained PAT with the 'Copilot Requests' permission and store it as COPILOT_GITHUB_TOKEN."
+            Write-Error "COPILOT_GITHUB_TOKEN secret is not configured on this repository. Create a fine-grained PAT with the 'Copilot Requests' permission and store it as a repo secret named COPILOT_GITHUB_TOKEN."
             exit 1
           }
           Write-Host "COPILOT_GITHUB_TOKEN present (length=$($env:COPILOT_GITHUB_TOKEN.Length))"
 
-      - name: Set up Node.js
+      - name: Set up Node.js (for Copilot CLI + npm-based build systems)
         uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -310,81 +308,26 @@ jobs:
           Get-Command cmake, ninja, git, python -ErrorAction SilentlyContinue |
             Format-Table Name, Source
 
-      - name: Derive repo name for artifact lookup
-        id: repo_name
+      - name: Install wos-* agents, instructions, skills, and prompts into ~/.copilot
         shell: pwsh
         run: |
-          $repoName = ($env:WOS_REPO_URL -split '/')[-1] -replace '\.git$',''
-          "repo_name=$repoName" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          $workRoot = "C:\src\wos-porter"
+          New-Item -ItemType Directory -Force -Path $workRoot | Out-Null
 
-      - name: Download x64 benchmark results from job1
-        id: download_bench
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          name: x64-benchmark-${{ steps.repo_name.outputs.repo_name }}
-          path: C:\src\x64-bench-results
-
-      - name: Resolve x64 benchmark path for porter
-        id: bench_path
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Continue'
-          $resultsRoot = "C:\src\x64-bench-results"
-          if (-not (Test-Path $resultsRoot)) {
-            Write-Warning "x64 benchmark artifact was not downloaded — porter will run without benchmark data."
-            "x64_bench_dir=" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-            exit 0
-          }
-
-          # The artifact is the full x64_benchmark/ tree. Locate it by finding
-          # any known Phase-6 result file (base_bench_x64.*) inside results/.
-          # That file's grandparent is x64_benchmark/. If no result files exist
-          # (Phase 6 did not complete) fall back to a known Phase-3/4 artifact
-          # (build.log or test_results.log) whose parent is x64_benchmark/.
-          $benchDir = $null
-
-          $resultFile = Get-ChildItem $resultsRoot -Recurse -File `
-                          -ErrorAction SilentlyContinue |
-                        Where-Object { $_.Name -match 'base_bench_x64' } |
-                        Select-Object -First 1
-          if ($resultFile) {
-            # results/base_bench_x64.* → parent=results/ → grandparent=x64_benchmark/
-            $benchDir = $resultFile.Directory.Parent.FullName
-            Write-Host "Located x64_benchmark/ via Phase-6 result file: $($resultFile.Name)"
-          } else {
-            # Phase 6 did not complete; try Phase-3/4 artifacts
-            $fallbackFile = Get-ChildItem $resultsRoot -Recurse -File `
-                              -ErrorAction SilentlyContinue |
-                            Where-Object { $_.Name -in @('build.log','test_results.log','targets.txt','REPORT.md') } |
-                            Select-Object -First 1
-            if ($fallbackFile) {
-              $benchDir = $fallbackFile.DirectoryName
-              Write-Warning "No Phase-6 result files found — using x64_benchmark/ located via $($fallbackFile.Name)"
-            } else {
-              Write-Warning "No known x64_benchmark artifacts found — using artifact root as-is."
-              $benchDir = $resultsRoot
-            }
-          }
-
-          "x64_bench_dir=$benchDir" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-
-          # Log every file present so the porter knows what data is available.
-          Write-Host "`n=== x64 benchmark artifact contents on ARM64 runner ==="
-          Get-ChildItem $benchDir -Recurse -File -ErrorAction SilentlyContinue |
-            ForEach-Object { Write-Host "  $($_.FullName -replace [regex]::Escape($benchDir), '')" }
-          Write-Host "====================================================`n"
-
-      - name: Install wos-* agents, skills, instructions, and prompts into ~/.copilot
-        shell: pwsh
-        run: |
-          $userHome  = $env:USERPROFILE
-          $agentsDst = Join-Path $userHome ".copilot\agents"
-          $instrDst  = Join-Path $userHome ".copilot\instructions"
-          $skillsDst = Join-Path $userHome ".copilot\skills"
+          $userHome   = $env:USERPROFILE
+          $agentsDst  = Join-Path $userHome ".copilot\agents"
+          $instrDst   = Join-Path $userHome ".copilot\instructions"
+          $skillsDst  = Join-Path $userHome ".copilot\skills"
           $promptsDst = Join-Path $userHome ".copilot\prompts"
-          New-Item -ItemType Directory -Force -Path $agentsDst, $instrDst, $skillsDst, $promptsDst | Out-Null
+          New-Item -ItemType Directory -Force -Path $agentsDst  | Out-Null
+          New-Item -ItemType Directory -Force -Path $instrDst   | Out-Null
+          New-Item -ItemType Directory -Force -Path $skillsDst  | Out-Null
+          New-Item -ItemType Directory -Force -Path $promptsDst | Out-Null
 
+          # Strip frontmatter keys Copilot CLI rejects (argument-hint, user-invocable).
+          # Special case for wos-porter: install it under the private name
+          # "wos-porter-orchestrator" so that task(agent_type="wos-porter") inside
+          # the agent finds nothing — preventing self-recursion at the CLI level.
           Get-ChildItem "$env:GITHUB_WORKSPACE\agents\wos-*.agent.md" | ForEach-Object {
             $srcPath = $_.FullName
             $dstPath = Join-Path $agentsDst $_.Name
@@ -392,12 +335,24 @@ jobs:
             if ($raw -notmatch '(?s)^---\r?\n(.*?)\r?\n---\r?\n(.*)$') {
               Write-Error "No YAML frontmatter in $srcPath"; exit 1
             }
-            $fmLines = ($Matches[1] -split "`r?`n") | Where-Object {
-              $_ -notmatch '^\s*(tools|agents|argument-hint|user-invocable)\s*:'
+            $fmLines = ($Matches[1] -split "`r?`n") |
+              Where-Object { $_ -notmatch '^\s*(argument-hint|user-invocable)\s*:' }
+
+            if ($_.Name -eq 'wos-porter.agent.md') {
+              # Rename the installed agent so the CLI cannot call it as "wos-porter".
+              # The run step below uses --agent=wos-porter-orchestrator to match.
+              $fmLines = $fmLines | ForEach-Object {
+                if ($_ -match '^(\s*name\s*:\s*)["'']?wos-porter["'']?\s*$') {
+                  'name: "wos-porter-orchestrator"'
+                } else { $_ }
+              }
+              # Also rename the destination file so it can't be discovered by old name.
+              $dstPath = Join-Path $agentsDst 'wos-porter-orchestrator.agent.md'
             }
+
             $out = "---`n$(($fmLines -join "`n").Trim())`n---`n$($Matches[2])"
             Set-Content -LiteralPath $dstPath -Value $out -Encoding UTF8
-            Write-Host "Installed agent: $dstPath"
+            Write-Host "Installed Copilot subagent: $dstPath"
           }
 
           Copy-Item "$env:GITHUB_WORKSPACE\instructions\*.instructions.md" `
@@ -414,38 +369,126 @@ jobs:
               -Destination $promptsDst -Force -ErrorAction SilentlyContinue
           }
 
+          Write-Host "--- Installed agents ---"
+          Get-ChildItem $agentsDst | Select-Object FullName
+          Write-Host "--- Installed instructions ---"
+          Get-ChildItem $instrDst | Select-Object FullName
+          Write-Host "--- Installed skills ---"
+          Get-ChildItem $skillsDst -Directory | Select-Object FullName
+
           "COPILOT_CUSTOM_INSTRUCTIONS_DIRS=$instrDst" |
             Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Create wos-porter work directory
-        shell: pwsh
-        run: New-Item -ItemType Directory -Force -Path "C:\src\wos-porter" | Out-Null
+      # ── Download x64 benchmark artifact from Job 1 ──────────────────────────
+      - name: Download x64 benchmark results
+        if: always()
+        uses: actions/download-artifact@v4
+        with:
+          pattern: x64-benchmark-*
+          path: C:\src\x64-results
+          merge-multiple: true
+        continue-on-error: true
 
-      - name: Run wos-porter agent (Copilot CLI)
-        working-directory: C:\src\wos-porter
+      # ── Locate downloaded files and set bench_dir output ────────────────────
+      - name: Locate x64 benchmark results
+        id: x64_bench
+        if: always()
         shell: pwsh
         run: |
-          # Continue throughout: same 2>&1 / ErrorRecord reason as x64-benchmarker step.
-          $ErrorActionPreference = 'Continue'
-          $workRoot = "C:\src\wos-porter"
-          $logDir = Join-Path $workRoot "_logs"
-          New-Item -ItemType Directory -Force -Path $logDir | Out-Null
-
-          # Build the prompt. If an x64 benchmark result was downloaded,
-          # tell the porter where to find it so the optimizer can use it.
-          $x64BenchDir = "${{ steps.bench_path.outputs.x64_bench_dir }}"
-          if ($x64BenchDir -and (Test-Path $x64BenchDir)) {
-            $prompt = "Port this repository to Windows ARM64: $env:WOS_REPO_URL`n`nAn x64 benchmark result is available at: $x64BenchDir`nUse it to guide ARM64 optimizations."
+          $downloadDir = "C:\src\x64-results"
+          Write-Host "=== Downloaded artifact tree ==="
+          if (Test-Path $downloadDir) {
+            Get-ChildItem -Recurse $downloadDir | Select-Object FullName | Format-Table -AutoSize
           } else {
-            $prompt = "Port this repository to Windows ARM64: $env:WOS_REPO_URL"
+            Write-Warning "$downloadDir not found — Job 1 artifact download failed."
+          }
+          $files = if (Test-Path $downloadDir) {
+            Get-ChildItem -Recurse -File $downloadDir -ErrorAction SilentlyContinue
+          }
+          if ($files.Count -gt 0) {
+            Write-Host "x64 benchmark artifacts available: $($files.Count) file(s)"
+            "available=true"         | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            "bench_dir=$downloadDir" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          } else {
+            Write-Warning "No x64 benchmark files — wos-porter will run without baseline."
+            "available=false" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            "bench_dir="      | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
           }
 
-          Write-Host "Prompt: $prompt"
-          Write-Host "Model:  $env:COPILOT_MODEL"
+      # ── Clone target repo and create arm64-port branch ──────────────────────
+      # Do this in the workflow so the agent receives a ready-to-use local path
+      # and never needs to clone or create a branch itself.
+      - name: Clone target repo and create arm64-port branch
+        id: clone
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $repoUrl = $env:WOS_REPO_URL
+
+          # Normalise owner/repo → full URL
+          if ($repoUrl -notmatch '^https?://') {
+            $repoUrl = "https://github.com/$repoUrl"
+          }
+
+          # Derive repo name from URL (last path segment, strip .git)
+          $repoName = ($repoUrl -split '/')[-1] -replace '\.git$', ''
+
+          $workRoot = "C:\src\wos-porter"
+          New-Item -ItemType Directory -Force -Path $workRoot | Out-Null
+          $repoDir = Join-Path $workRoot $repoName
+
+          # Remove stale clone if present
+          if (Test-Path $repoDir) {
+            Write-Host "Removing existing $repoDir"
+            Remove-Item -Recurse -Force $repoDir
+          }
+
+          Write-Host "Cloning $repoUrl -> $repoDir"
+          git clone --recurse-submodules $repoUrl $repoDir
+          if ($LASTEXITCODE -ne 0) { Write-Error "git clone failed"; exit 1 }
+
+          git config --global user.email "ci-wos-porter@github-actions"
+          git config --global user.name  "CI wos-porter"
+
+          Write-Host "Creating arm64-port branch"
+          git -C $repoDir checkout -b arm64-port
+          if ($LASTEXITCODE -ne 0) { Write-Error "git checkout -b arm64-port failed"; exit 1 }
+
+          Write-Host "Repo cloned and branch created: $repoDir"
+          git -C $repoDir branch -a
+
+          "repo_dir=$repoDir"   | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "repo_name=$repoName" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Run wos-porter headless (Copilot CLI)
+        working-directory: C:\src\wos-porter
+        shell: pwsh
+        env:
+          REPO_DIR:     ${{ steps.clone.outputs.repo_dir }}
+          X64_BENCH_DIR: ${{ steps.x64_bench.outputs.bench_dir }}
+          COPILOT_TASK_WAIT_TIMEOUT_SECONDS: "21000"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $logDir = "C:\src\wos-porter\_logs"
+          New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+
+          # Pass the pre-cloned local path so the agent skips Phase 1 cloning.
+          # Append x64 benchmark dir if Job 1 produced one.
+          $prompt = "Port the repository at $env:REPO_DIR to Windows ARM64. The repository has already been cloned and the arm64-port branch has been created — do NOT clone again, do NOT run git checkout -b. Start from Phase 2 (Analysis)."
+          if ($env:X64_BENCH_DIR) {
+            $prompt += "`nx64 benchmark results: $env:X64_BENCH_DIR"
+            Write-Host "x64 baseline included: $env:X64_BENCH_DIR"
+          } else {
+            Write-Host "No x64 baseline — running without benchmark comparison."
+          }
+
+          Write-Host "Repo dir: $env:REPO_DIR"
+          Write-Host "Prompt:   $prompt"
+          Write-Host "Model:    $env:COPILOT_MODEL"
 
           copilot `
             -p $prompt `
-            --agent=wos-porter `
+            --agent=wos-porter-orchestrator `
             --model=$env:COPILOT_MODEL `
             --autopilot `
             --max-autopilot-continues ([int]$env:MAX_AUTOPILOT_CONTINUES) `
@@ -454,51 +497,47 @@ jobs:
             --allow-all-urls `
             --output-format=json `
             --log-dir=$logDir `
-            --log-level=info |
-            Tee-Object -FilePath (Join-Path $logDir "copilot-arm64-run.jsonl")
+            --log-level=info `
+            2>&1 |
+            Tee-Object -FilePath (Join-Path $logDir "copilot-run.jsonl")
 
-          if (-not $? -or $LASTEXITCODE -ne 0) {
-            Write-Warning "copilot wos-porter exited with code $LASTEXITCODE (command found: $?) — artifacts will still be uploaded."
-          }
+          Write-Host "copilot exit code: $LASTEXITCODE"
 
-      - name: Locate ported repo
-        id: locate
-        if: always()
+      # ── After agent run: commit any uncommitted changes to arm64-port ────────
+      - name: Commit any uncommitted agent changes to arm64-port
+        if: always() && steps.clone.outputs.repo_dir != ''
+        working-directory: ${{ steps.clone.outputs.repo_dir }}
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Continue'
-          $portedRoot = "C:\src\wos-porter"
-          if (-not (Test-Path $portedRoot)) {
-            Write-Warning "$portedRoot does not exist — porter never ran or failed before cloning."
-            "ported_repo=" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-            exit 0
+          Write-Host "=== Branch state after agent run ==="
+          git branch -a
+          git log --oneline -5
+
+          $status = git status --porcelain
+          if ($status) {
+            Write-Host "Uncommitted changes — committing to arm64-port:"
+            Write-Host $status
+            git add -A
+            git commit -m "chore: ARM64 port changes (committed by CI after agent run)"
+          } else {
+            Write-Host "Working tree clean — no extra commit needed."
           }
-          $candidates = Get-ChildItem -Directory $portedRoot -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -ne '_logs' -and (Test-Path (Join-Path $_.FullName '.git')) }
-          if (-not $candidates) {
-            Write-Warning "No cloned repo found under $portedRoot."
-            "ported_repo=" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-            exit 0
-          }
-          $ported = $candidates | Select-Object -First 1
-          Write-Host "Ported repo: $($ported.FullName)"
-          "ported_repo=$($ported.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          "ported_name=$($ported.Name)"     | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
       - name: Generate arm64-port patch + summary
-        if: always() && steps.locate.outputs.ported_repo != ''
-        working-directory: ${{ steps.locate.outputs.ported_repo }}
+        if: always() && steps.clone.outputs.repo_dir != ''
+        working-directory: ${{ steps.clone.outputs.repo_dir }}
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Continue'
-          $outDir = "C:\src\wos-porter\_artifacts"
+          $outDir    = "C:\src\wos-porter\_artifacts"
           $seriesDir = Join-Path $outDir "patches"
           New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 
-          $port = 'arm64-port'
+          $port    = 'arm64-port'
           $portSha = (git rev-parse --verify --quiet "refs/heads/$port")
           if (-not $portSha) {
-            Write-Warning "Branch '$port' not found — capturing working-tree diff as fallback."
+            Write-Warning "Branch '$port' not found — capturing working-tree diff instead."
             git status | Tee-Object (Join-Path $outDir "git-status.txt") | Out-Null
             git diff --binary HEAD | Out-File -Encoding ascii (Join-Path $outDir "working-tree.diff")
             exit 0
@@ -507,27 +546,25 @@ jobs:
           $base = $null
           foreach ($cand in @('main','master','origin/main','origin/master','origin/HEAD')) {
             if ($cand -eq $port) { continue }
-            $sha = (git rev-parse --verify --quiet $cand)
-            if ($sha) { $base = $cand; break }
+            if ((git rev-parse --verify --quiet $cand)) { $base = $cand; break }
           }
           if (-not $base) {
             $base = (git rev-list --max-parents=0 "$port" | Select-Object -Last 1)
           }
 
-          $forkPointRaw = git merge-base $base $port
-          $forkPoint = if ($forkPointRaw) { $forkPointRaw.Trim() } else { $null }
+          $forkPoint = (git merge-base $base $port).Trim()
           if (-not $forkPoint) { $forkPoint = $base }
-          Write-Host "Base: $base  fork-point: $forkPoint  port-tip: $portSha"
+          Write-Host "Base: $base  fork-point: $forkPoint  tip: $portSha"
 
-          $range = "$forkPoint..$port"
+          $range       = "$forkPoint..$port"
           $commitCount = [int](git rev-list --count $range)
           Write-Host "Commits on $port since fork: $commitCount"
 
           git log --oneline $range | Tee-Object (Join-Path $outDir "commits.txt")
-          git diff --stat $range   | Tee-Object (Join-Path $outDir "diffstat.txt")
+          git diff --stat   $range | Tee-Object (Join-Path $outDir "diffstat.txt")
 
           if ($commitCount -eq 0) {
-            Write-Warning "No commits on '$port' — capturing working-tree diff as fallback."
+            Write-Warning "No commits on '$port' — capturing diffs as fallback."
             git diff --binary $range | Out-File -Encoding ascii (Join-Path $outDir "arm64-port.diff")
             git diff --binary HEAD   | Out-File -Encoding ascii (Join-Path $outDir "working-tree.diff")
           } else {
@@ -544,38 +581,38 @@ jobs:
           if (Test-Path "ARM64-PORT.md") {
             Copy-Item "ARM64-PORT.md" (Join-Path $outDir "ARM64-PORT.md") -Force
           } else {
-            Write-Warning "ARM64-PORT.md not produced — Phase 8 did not complete."
+            Write-Warning "ARM64-PORT.md was not produced — Phase 8 did not complete."
           }
 
-      - name: Upload ARM64 porter run log
+      - name: Upload run log
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: arm64-porter-log-${{ steps.locate.outputs.ported_name || 'run' }}
+          name: copilot-run-log
           path: C:\src\wos-porter\_logs\**
           if-no-files-found: warn
 
-      - name: Upload ARM64 port artifacts (patches + report)
-        if: always() && steps.locate.outputs.ported_repo != ''
+      - name: Upload ARM64 port artifacts (patch + report)
+        if: always() && steps.clone.outputs.repo_dir != ''
         uses: actions/upload-artifact@v4
         with:
-          name: arm64-port-copilot-${{ steps.locate.outputs.ported_name }}
+          name: arm64-port-copilot-${{ steps.clone.outputs.repo_name }}
           path: C:\src\wos-porter\_artifacts\**
           if-no-files-found: warn
 
       - name: Upload full ported working tree (branch arm64-port)
-        if: always() && steps.locate.outputs.ported_repo != ''
+        if: always() && steps.clone.outputs.repo_dir != ''
         uses: actions/upload-artifact@v4
         with:
-          name: ported-repo-copilot-${{ steps.locate.outputs.ported_name }}
+          name: ported-repo-copilot-${{ steps.clone.outputs.repo_name }}
           path: |
-            ${{ steps.locate.outputs.ported_repo }}/**
-            !${{ steps.locate.outputs.ported_repo }}/**/node_modules/**
-            !${{ steps.locate.outputs.ported_repo }}/**/target/**
-            !${{ steps.locate.outputs.ported_repo }}/**/build/**
-            !${{ steps.locate.outputs.ported_repo }}/**/build-arm64/**
-            !${{ steps.locate.outputs.ported_repo }}/**/out/**
-            !${{ steps.locate.outputs.ported_repo }}/**/x64/**
-            !${{ steps.locate.outputs.ported_repo }}/**/Debug/**
-            !${{ steps.locate.outputs.ported_repo }}/**/Release/**
+            ${{ steps.clone.outputs.repo_dir }}/**
+            !${{ steps.clone.outputs.repo_dir }}/**/node_modules/**
+            !${{ steps.clone.outputs.repo_dir }}/**/target/**
+            !${{ steps.clone.outputs.repo_dir }}/**/build/**
+            !${{ steps.clone.outputs.repo_dir }}/**/build-arm64/**
+            !${{ steps.clone.outputs.repo_dir }}/**/out/**
+            !${{ steps.clone.outputs.repo_dir }}/**/x64/**
+            !${{ steps.clone.outputs.repo_dir }}/**/Debug/**
+            !${{ steps.clone.outputs.repo_dir }}/**/Release/**
           if-no-files-found: warn
