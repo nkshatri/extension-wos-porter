@@ -63,7 +63,7 @@ jobs:
           Write-Host "COPILOT_GITHUB_TOKEN present (length=$($env:COPILOT_GITHUB_TOKEN.Length))"
 
       - name: Set up Node.js (for Copilot CLI + npm-based build systems)
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 20
 
