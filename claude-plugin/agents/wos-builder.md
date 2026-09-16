@@ -225,10 +225,32 @@ To check "reproduces on x64 too" cheaply when unsure: attempt the single failing
 
 When the error doesn't fit any row above, capture the **first** (not last) error line plus 20 lines of context, search this file for the closest keyword, and apply that recipe with a note. Never silently skip a class of errors — record "unmatched error pattern" in the per-cycle log so reviewers can extend this table.
 
-**Commit each fix cycle:**
+**Commit each fix cycle — stage only ARM64-relevant files:**
 ```powershell
-git add -A
-git commit -m "ARM64 build fix cycle <N>: <description>"
+# Read project style/convention detected in Phase 1
+$styleFile = Join-Path $projectPath '.copilot\state\wos-style.json'
+$commitConvention = if (Test-Path $styleFile) {
+    (Get-Content $styleFile -Raw | ConvertFrom-Json).commitConvention
+} else { 'imperative' }
+
+# Stage only source/build-system files — never build artifacts, IDE files, or lock files
+$toStage = git -C $projectPath diff --name-only | Where-Object {
+    $_ -notmatch '[\\/](obj|bin|Debug|Release|ARM64|x64)[\\/]' -and
+    $_ -notmatch '\.(lock|sum|ilk|pdb|exp|tlog|lastbuildstate|idb|ipch|vc\.db|user)$' -and
+    $_ -notmatch '^\.vs[\\/]'
+}
+if ($toStage) { $toStage | ForEach-Object { git -C $projectPath add $_ } }
+
+# Sanity-check: review staged set before committing
+git -C $projectPath diff --cached --stat
+# If unrelated files appear above, unstage them: git restore --staged <file>
+
+$msg = if ($commitConvention -eq 'conventional') {
+    "build(arm64): fix cycle <N> - <description>"
+} else {
+    "ARM64 build fix cycle <N>: <description>"
+}
+git -C $projectPath commit -m $msg
 ```
 
 Track: `Cycle N: X errors → fixed Y → committed → Z remaining`
@@ -267,7 +289,23 @@ Track: `Cycle N: X errors → fixed Y → committed → Z remaining`
 
 **NOT complete until a patch file exists and its path is reported.**
 
-1. Commit any remaining changes.
+1. Commit any remaining source/build-system changes — use the same targeted filter as the fix-cycle commits (no build artifacts, no IDE files, no benchmark results):
+   ```powershell
+   $styleFile = Join-Path $projectPath '.copilot\state\wos-style.json'
+   $commitConvention = if (Test-Path $styleFile) { (Get-Content $styleFile -Raw | ConvertFrom-Json).commitConvention } else { 'imperative' }
+   $remaining = git -C $projectPath diff --name-only | Where-Object {
+       $_ -notmatch '[\\/](obj|bin|Debug|Release|ARM64|x64)[\\/]' -and
+       $_ -notmatch '\.(lock|sum|ilk|pdb|exp|tlog|lastbuildstate|idb|ipch|vc\.db|user)$' -and
+       $_ -notmatch '^\.vs[\\/]' -and
+       $_ -notmatch '^benchmarks[\\/]'
+   }
+   if ($remaining) {
+       $remaining | ForEach-Object { git -C $projectPath add $_ }
+       git -C $projectPath diff --cached --stat
+       $msg = if ($commitConvention -eq 'conventional') { "build(arm64): final source fixes" } else { "ARM64: final source fixes" }
+       git -C $projectPath commit -m $msg
+   }
+   ```
 2. Show commit log: `git log --oneline $baseCommit..HEAD`
 3. Generate unified patch: `git diff $baseCommit..HEAD > arm64-build-fixes.patch`
 4. Generate per-commit patches: `git format-patch $baseCommit..HEAD -o arm64-patches/`

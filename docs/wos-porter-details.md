@@ -4,13 +4,14 @@
 
 | Agent | Role |
 |-------|------|
-| `wos-porter` | Main orchestrator — runs the full 8-phase porting pipeline |
+| `wos-porter` | Main orchestrator — runs the full 9-phase porting pipeline |
 | `wos-analyzer` | Read-only deep scan of a repo for ARM64 readiness |
 | `wos-build-porter` | Modifies build configurations (CMake, MSBuild, Meson, Cargo, etc.) |
-| `wos-code-porter` | Ports x64-specific source code (SIMD, inline asm, arch guards) |
-| `wos-builder` | Builds, validates binaries with dumpbin, and fixes build errors |
-| `wos-tester` | Runs and fixes ARM64 test suites and benchmarks |
-| `wos-optimizer` | Applies hand-written ARM NEON intrinsics to hot kernels for performance |
+| `wos-code-porter` | Ports x64-specific source code (SIMD, inline asm, arch guards); reads `wos-style.json` for indent/format |
+| `wos-builder` | Builds, validates binaries with dumpbin, and fixes build errors; targeted commits (no artifacts or lock files) |
+| `wos-tester` | Runs and fixes ARM64 test suites and benchmarks; stages only the specific files fixed per cycle |
+| `wos-optimizer` | Applies hand-written ARM NEON intrinsics to hot kernels for performance (coverage-driven, no x64 baseline) |
+| `wos-benchmark-optimizer` | Differential x64 → ARM64 optimizer; invoked only when a Windows x64 benchmark file is supplied; gap-closes functions where ARM64 ratio ≥ 1.15 behind x64 |
 
 ## Instructions
 
@@ -70,3 +71,16 @@ CMake, MSBuild/Visual Studio, Meson, Make/NMake, Cargo (Rust), Autotools, Bazel,
 | Variable | Default | Purpose |
 |---|---|---|
 | `WOS_PORTER_WORKDIR` | `C:\src\wos-porter` (Windows), `$HOME/wos-porter` (other) | Root folder where the porter clones target repos and writes `<repo>\.copilot\state\wos-toolchain.json`. Set this if the default drive is unwritable or you need clones on a different volume. |
+
+## State Files Written per Repo
+
+| File | Written by | Consumed by |
+|------|-----------|-------------|
+| `<repo>\.copilot\state\wos-toolchain.json` | `wos-toolchain-discovery` skill (Phase 4) | `wos-builder`, `wos-tester`, `wos-optimizer` |
+| `<repo>\.copilot\state\wos-style.json` | `wos-porter` Phase 1 step 2a | All agents that edit source or create commits |
+| `<repo>\.copilot\state\wos-deps.json` | `wos-porter` Phase 4 | Phase 5 build, Phase 8 report |
+| `<repo>\.copilot\state\optimizer-deferred.json` | `wos-optimizer` / `wos-benchmark-optimizer` | Phase 7 budget-resume loop |
+| `<repo>\benchmarks\base_bench_win_arm.*` | `wos-tester` Phase 6 | Phase 7 differential optimizer, Phase 8 report |
+| `<repo>\ARM64-PORT.md` | `wos-porter` Phase 8 | Final deliverable — build, run-tests, run-benchmarks steps + perf tables |
+
+`wos-style.json` fields: `indentStyle`, `indentSize`, `lineEnding`, `clangFormatPresent`, `commitConvention` (`conventional` | `imperative`), `commitSample`.
