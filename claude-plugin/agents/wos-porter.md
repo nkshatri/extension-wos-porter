@@ -36,6 +36,17 @@ The 8 phases you MUST execute in this exact order — each phase has a REQUIRED 
    - `$X64_BENCH` empty → Phase 7 uses **`wos-optimizer`** (scans for NEON-optimizable hot code against the ARM64 scalar baseline).
 
    Carry `$X64_BENCH` (and its emptiness) forward to Phase 7 — it does not affect Phases 2–6.
+
+   **Optional skip flag — `WOS_SKIP_OPTIMIZE`.** Phase 7 is skipped unconditionally when either:
+   - the environment variable `WOS_SKIP_OPTIMIZE` is set to `1` or `true`, **or**
+   - the user's prompt contains the text `WOS_SKIP_OPTIMIZE=1` or `skip optimization` (case-insensitive).
+
+   Resolve at Phase 1 and carry forward:
+   ```powershell
+   $skipOptimize = ($env:WOS_SKIP_OPTIMIZE -eq '1' -or $env:WOS_SKIP_OPTIMIZE -eq 'true') -or
+                   ($userPrompt -match 'WOS_SKIP_OPTIMIZE=1' -or $userPrompt -imatch 'skip.?optim')
+   ```
+   Phase 8 must note "Phase 7 skipped — WOS_SKIP_OPTIMIZE set" in the NEON Optimizations section.
 2. Resolve the work root and clone target. Honour the `WOS_PORTER_WORKDIR` environment variable if set; otherwise default to `C:\src\wos-porter` on Windows or `$HOME/wos-porter` elsewhere. Never fall back to `$env:TEMP` — the location must be stable across phases so `<workDir>\.copilot\state\wos-toolchain.json` survives.
    ```powershell
    $workRoot = if ($env:WOS_PORTER_WORKDIR) { $env:WOS_PORTER_WORKDIR }
@@ -224,6 +235,7 @@ Binary validation (dumpbin) was completed by `wos-builder` in Phase 5. Phase 6 r
 After the project builds and tests pass on ARM64, scan for NEON-optimizable hot functions and apply `arm_neon.h` intrinsics for performance — strictly additive, guarded behind `#if defined(_M_ARM64) || defined(__aarch64__)`, never touching the x64 path.
 
 **GATE CHECK — skip Phase 7 (and note "skipped" in the Phase 8 report) if ANY of the following is true:**
+- **`$skipOptimize` is `$true`** (`WOS_SKIP_OPTIMIZE=1` was set at Phase 1).
 - Phase 5 build failed (no working ARM64 binaries to optimize).
 - Phase 6 has unresolved test failures (don't add NEON on top of broken code).
 - The project is pure managed code (.NET / Java / Go) with no native C/C++/Rust hot paths — NEON intrinsics don't apply.
