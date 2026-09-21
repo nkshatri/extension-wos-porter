@@ -44,7 +44,6 @@ Run the `x64-benchmarker` agent to capture an x64 baseline, then pass it to the 
 ## Documentation
 
 - [WoS Porter Details](docs/wos-porter-details.md) — Agents, instructions, skills, prompts, commands, supported build systems
-- [Pipeline Flow](docs/wos-porter-flow.md) — 8-phase Mermaid flowchart with phase summary table
 - [Skip Optimization](docs/skip-optimization.md) — How to skip Phase 7 when only porting is needed
 - [x64 Competitive Analysis](docs/x64-competitive-analysis.md) — Baseline benchmarking and differential optimization guide
 - [Development](docs/development.md) — Build, package, and publish commands for contributors
