@@ -36,6 +36,17 @@ The 8 phases you MUST execute in this exact order — each phase has a REQUIRED 
    - `$X64_BENCH` empty → Phase 7 uses **`wos-optimizer`** (scans for NEON-optimizable hot code against the ARM64 scalar baseline).
 
    Carry `$X64_BENCH` (and its emptiness) forward to Phase 7 — it does not affect Phases 2–6.
+
+   **Optional skip flag — `WOS_SKIP_OPTIMIZE`.** Phase 7 is skipped unconditionally when either:
+   - the environment variable `WOS_SKIP_OPTIMIZE` is set to `1` or `true`, **or**
+   - the user's prompt contains the text `WOS_SKIP_OPTIMIZE=1` or `skip optimization` (case-insensitive).
+
+   Resolve at Phase 1 and carry forward:
+   ```powershell
+   $skipOptimize = ($env:WOS_SKIP_OPTIMIZE -eq '1' -or $env:WOS_SKIP_OPTIMIZE -eq 'true') -or
+                   ($userPrompt -match 'WOS_SKIP_OPTIMIZE=1' -or $userPrompt -imatch 'skip.?optim')
+   ```
+   Phase 8 must note "Phase 7 skipped — WOS_SKIP_OPTIMIZE set" in the NEON Optimizations section.
 2. Resolve the work root and clone target. Honour the `WOS_PORTER_WORKDIR` environment variable if set; otherwise default to `C:\src\wos-porter` on Windows or `$HOME/wos-porter` elsewhere. Never fall back to `$env:TEMP` — the location must be stable across phases so `<workDir>\.copilot\state\wos-toolchain.json` survives.
    ```powershell
    $workRoot = if ($env:WOS_PORTER_WORKDIR) { $env:WOS_PORTER_WORKDIR }
@@ -48,6 +59,39 @@ The 8 phases you MUST execute in this exact order — each phase has a REQUIRED 
    - Clone with `git clone --recurse-submodules <url> <repoName>`. If the project uses Git LFS, also run `git lfs pull` (skip silently if `git lfs` is not installed and no LFS pointers exist).
    - If the repo was cloned without `--recurse-submodules` (e.g. reusing an existing folder), run `git submodule update --init --recursive` before creating the branch.
    - Verify with `git submodule status` — every line should show a commit hash without a leading `-` (missing) or `+` (out-of-date). If any submodule is missing/dirty, rerun `git submodule update --init --recursive --force` and report as blocking if it still fails.
+2a. **Detect project coding style and commit convention** — run once immediately after clone, store to `<workDir>\.copilot\state\wos-style.json` so all sub-agents can read it before editing files or forming commit messages.
+   ```powershell
+   New-Item -ItemType Directory -Force -Path "$workDir\.copilot\state" | Out-Null
+   $style = [ordered]@{ indentStyle='space'; indentSize='4'; lineEnding='CRLF'; clangFormatPresent=$false; commitConvention='imperative'; commitSample='' }
+
+   # 1. Indent style from .editorconfig
+   $ec = Get-ChildItem $workDir -Filter '.editorconfig' -Recurse -Depth 3 -ErrorAction SilentlyContinue | Select-Object -First 1
+   if ($ec) {
+       $ecContent = Get-Content $ec.FullName -Raw
+       $style.editorConfigPath = $ec.FullName
+       $style.indentStyle = if ($ecContent -match 'indent_style\s*=\s*tab') { 'tab' } else { 'space' }
+       if ($ecContent -match 'indent_size\s*=\s*(\d+)') { $style.indentSize = $Matches[1] }
+       if ($ecContent -match 'end_of_line\s*=\s*(crlf|lf|cr)') { $style.lineEnding = $Matches[1].ToUpper() }
+   }
+
+   # 2. clang-format presence
+   $cf = Get-ChildItem $workDir -Filter '.clang-format' -Depth 3 -ErrorAction SilentlyContinue | Select-Object -First 1
+   $style.clangFormatPresent = ($null -ne $cf)
+   if ($cf) { $style.clangFormatPath = $cf.FullName }
+
+   # 3. Commit message convention — detect conventional-commits vs imperative style
+   $log = git -C $workDir log --oneline -15 2>$null
+   $conventionalHits = ($log | Select-String '^[0-9a-f]+ (feat|fix|chore|refactor|docs|style|test|ci|build|perf)(\(.+\))?:').Count
+   $style.commitConvention = if ($conventionalHits -ge 3) { 'conventional' } else { 'imperative' }
+   $style.commitSample = if ($log) { ($log | Select-Object -First 1) -replace '^[0-9a-f]+ ', '' } else { '' }
+
+   $style | ConvertTo-Json | Set-Content "$workDir\.copilot\state\wos-style.json"
+   Write-Host "Style: indent=$($style.indentStyle)/$($style.indentSize), lineEnding=$($style.lineEnding), clangFormat=$($style.clangFormatPresent), commits=$($style.commitConvention)"
+   ```
+   **Sub-agent commit message rules** (all sub-agents must read `wos-style.json` before committing):
+   - `commitConvention = "conventional"` → use `build(arm64):` / `fix(arm64):` prefixes
+   - `commitConvention = "imperative"` → use existing `"ARM64: ..."` prefix style
+   **Sub-agent editing rules**: match `indentStyle`/`indentSize` in new code blocks; if `clangFormatPresent = true`, do not introduce style inconsistencies that will cause noisy diffs.
 3. Create todo list with EXACTLY these items (all 8 phases must appear):
    ```
    1. "Phase 1: Clone and branch" -> completed (you just did it)
@@ -191,6 +235,7 @@ Binary validation (dumpbin) was completed by `wos-builder` in Phase 5. Phase 6 r
 After the project builds and tests pass on ARM64, scan for NEON-optimizable hot functions and apply `arm_neon.h` intrinsics for performance — strictly additive, guarded behind `#if defined(_M_ARM64) || defined(__aarch64__)`, never touching the x64 path.
 
 **GATE CHECK — skip Phase 7 (and note "skipped" in the Phase 8 report) if ANY of the following is true:**
+- **`$skipOptimize` is `$true`** (`WOS_SKIP_OPTIMIZE=1` was set at Phase 1).
 - Phase 5 build failed (no working ARM64 binaries to optimize).
 - Phase 6 has unresolved test failures (don't add NEON on top of broken code).
 - The project is pure managed code (.NET / Java / Go) with no native C/C++/Rust hot paths — NEON intrinsics don't apply.
@@ -238,6 +283,51 @@ Invoke exactly ONE of them. The VERIFICATION and coverage gates (steps 29–30a)
 29a. **FORBIDDEN skip-reason audit**: load the [wos-forbidden-skip-reasons](../skills/wos-forbidden-skip-reasons/SKILL.md) skill for the canonical `$forbiddenPatterns` regex list and evidence rules. Run its "Usage snippet" against `$optimizerReport` (and `ARM64-PORT.md` if it exists). If any offending row is found, re-invoke `wos-optimizer` ONCE with a prompt that names every offending file and its forbidden pattern, instructing it to (i) hand-port with baseline ARMv8.0 NEON intrinsics and let the per-kernel benchmark gate decide, OR (ii) cite a VALID skip reason with concrete evidence (compiler error, test name, measured scalar/NEON numbers, vendored path, or named sibling file with measured perf). If a second report still uses any forbidden pattern, record those files in the Phase 8 README's "Limitations & Known Issues" verbatim, flagged as un-justified skips for human review.
 
 30. Confirm the optimizer's commits land on `arm64-port` and the build is still green: `git log --oneline main..arm64-port; git status` (status must be clean). If any commit broke the build despite the optimizer's claims, revert it: `git revert --no-edit <bad-hash>`.
+
+    **If `git status` is NOT clean** after the optimizer finishes, handle uncommitted files one category at a time — NEVER bundle different categories into one commit:
+    ```powershell
+    # Category 1: Benchmark result files → dedicated commit
+    $benchUntracked = git -C $workDir ls-files --others --exclude-standard | Where-Object { $_ -match '^benchmarks[\\/]base_bench_win_arm' }
+    $benchModified  = git -C $workDir diff --name-only | Where-Object { $_ -match '^benchmarks[\\/]base_bench_win_arm' }
+    if ($benchUntracked -or $benchModified) {
+        ($benchUntracked + $benchModified) | ForEach-Object { git -C $workDir add $_ }
+        git -C $workDir diff --cached --stat   # verify ONLY benchmark files
+        git -C $workDir commit -m "ARM64: record post-optimization benchmark results"
+    }
+
+    # Category 2: .gitignore additions for build artifacts or agent scratch state → dedicated commit
+    $gitignoreChanged = git -C $workDir diff --name-only HEAD -- '.gitignore' 2>$null
+    $gitignoreNew     = git -C $workDir ls-files --others --exclude-standard -- '.gitignore' 2>$null
+    if ($gitignoreChanged -or $gitignoreNew) {
+        git -C $workDir add .gitignore
+        git -C $workDir diff --cached --stat
+        git -C $workDir commit -m "ARM64: add .gitignore for build artifacts and agent state"
+    }
+
+    # Category 3: ARM64-PORT.md — do NOT commit here; Phase 8 handles it
+
+    # Category 4: Temporary scripts or scratch files created by agents → delete, do NOT commit
+    $agentScrap = git -C $workDir ls-files --others --exclude-standard | Where-Object {
+        $_ -match '\.(ps1|sh|bat|cmd)$' -and ($_ -match '(scratch|temp|tmp|helper|agent|run_)')
+    }
+    if ($agentScrap) {
+        Write-Warning "Removing temporary agent files (do NOT commit these): $($agentScrap -join ', ')"
+        $agentScrap | ForEach-Object { Remove-Item (Join-Path $workDir $_) -Force -ErrorAction SilentlyContinue }
+    }
+
+    # Category 5: Any other source/build-system changes → targeted commit with artifact filter
+    $remaining = git -C $workDir diff --name-only | Where-Object {
+        $_ -notmatch '[\\/](obj|bin|Debug|Release|ARM64|x64)[\\/]' -and
+        $_ -notmatch '\.(lock|sum|ilk|pdb|exp|tlog|lastbuildstate|idb|ipch|vc\.db|user)$' -and
+        $_ -notmatch '^\.vs[\\/]' -and
+        $_ -notmatch '^benchmarks[\\/]base_bench_win_arm'
+    }
+    if ($remaining) {
+        $remaining | ForEach-Object { git -C $workDir add $_ }
+        git -C $workDir diff --cached --stat   # review before committing
+        git -C $workDir commit -m "ARM64: remaining source fixes"
+    }
+    ```
 
 30a. **Coverage re-invocation gate (default path — `wos-optimizer` only; skip this step when `wos-benchmark-optimizer` ran, since it is gap-driven not coverage-driven)**: enumerate SSE/AVX-heavy translation units in the repo and confirm each is accounted for:
 ```powershell
@@ -323,12 +413,30 @@ For EACH failing gate, re-invoke the corresponding sub-agent with a prompt namin
 
     ## Build Steps (ARM64)
     Prerequisites: Visual Studio 2022 with the **MSVC v143 - ARM64 build tools** and **Windows 11 SDK** components.
+    <List any additional project-specific prerequisites (ARM64 Python, vcpkg, CMake, etc.) or omit if none>
 
+    ### Build
     ```powershell
     <exact, copy-pasteable command sequence used in Phase 5, including vcvars setup if required>
     ```
-
     Build output: `<relative path to ARM64 binaries>`
+
+    ### Run Tests
+    ```powershell
+    <exact test commands from wos-tester Phase 6 — copy-pasteable as-is, e.g.:>
+    ctest --test-dir build-arm64 -C Release --output-on-failure
+    # or: .\build-arm64\Release\<test_exe>.exe
+    # or: cargo test --target aarch64-pc-windows-msvc --release
+    # or: dotnet test -c Release -r win-arm64
+    # or: go test ./...
+    ```
+    Expected: <N> passed, 0 failed — see Test Results section for the full table.
+
+    ### Run Benchmarks
+    ```powershell
+    <exact benchmark commands from wos-tester Phase 6 — copy-pasteable as-is>
+    ```
+    Output is written to `benchmarks/base_bench_win_arm.<ext>`. Reference numbers are in the Benchmark Results section below.
 
     ## Test Results
     - **Build host**: <x64 cross-compile / native ARM64>

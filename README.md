@@ -27,11 +27,26 @@ Give it a GitHub repository URL or a local path to an x64 project and it will:
 
 - **[GitHub Copilot (VS Code Extension)](docs/copilot-installation.md)** — Install VSIX, open Copilot Chat, and start porting
 - **[Claude Code (Plugin)](claude-plugin/README.md)** — Install and run as a Claude Code plugin
-- **[Run in the Cloud (GitHub Actions)](docs/github-actions.md)** — No local ARM64 machine needed; runs on `windows-11-arm` runners
+- **[Run in the Cloud (GitHub Actions)](docs/github-actions.md)** — No local ARM64 machine needed; runs on `windows-11-arm` runners. **Best for small, straightforward projects** — use Claude Code or Copilot locally for medium/complex projects.
+
+## Skip Optimization (Porting Only)
+
+By default the pipeline runs NEON optimization (Phase 7) after building and testing. Set `WOS_SKIP_OPTIMIZE=1` to skip it when you only need a working ARM64 port.
+
+→ **[Skip Optimization guide](docs/skip-optimization.md)**
+
+## x64 Competitive Analysis
+
+Run the `x64-benchmarker` agent to capture an x64 baseline, then pass it to the porter via `WOS_X64_BENCH` to enable gap-driven differential optimization and generate an ARM64 vs x64 performance comparison table.
+
+→ **[x64 Competitive Analysis guide](docs/x64-competitive-analysis.md)**
 
 ## Documentation
 
 - [WoS Porter Details](docs/wos-porter-details.md) — Agents, instructions, skills, prompts, commands, supported build systems
+- [Pipeline Flow](docs/wos-porter-flow.md) — 8-phase Mermaid flowchart with phase summary table
+- [Skip Optimization](docs/skip-optimization.md) — How to skip Phase 7 when only porting is needed
+- [x64 Competitive Analysis](docs/x64-competitive-analysis.md) — Baseline benchmarking and differential optimization guide
 - [Development](docs/development.md) — Build, package, and publish commands for contributors
 
 ## License

@@ -1,5 +1,13 @@
 # Run in the Cloud (GitHub Actions)
 
+> ⚠️ **Cloud workflows work best for smaller, straightforward projects.** For medium or complex projects — those with heavy SIMD, intricate build systems, many failing tests, or projects that need interactive fix cycles — use **[GitHub Copilot locally (VS Code extension)](copilot-installation.md)** or the **[Claude Code plugin](../claude-plugin/README.md)** instead. Local runs give full interactive visibility and the ability to intervene at each phase; cloud runs are unattended and will hit time limits or produce incomplete ports on hard projects.
+
+| Project complexity | Recommended approach |
+|---|---|
+| Small / straightforward (clean CMake or MSBuild, no SIMD, standard deps) | ✅ GitHub Actions (this guide) |
+| Medium (some SIMD, vcpkg deps, a few test failures to fix) | ⚠️ GitHub Actions may work — monitor the run; local preferred |
+| Complex (heavy SSE/AVX, custom build system, many test failures, NEON optimization needed) | ❌ Use Claude Code or Copilot locally |
+
 > **Recommended:** Cloud deployment via GitHub Actions is still evolving. For best porting results, run the agent locally using the **GitHub Copilot VS Code extension** or the **Claude Code plugin** — local runs give full interactive visibility and the ability to intervene when needed. Use the workflows below when you don't have a local ARM64 machine or want an automated, unattended run.
 
 Three workflow variants are available — pick the one that matches your credentials:
