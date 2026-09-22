@@ -1,6 +1,6 @@
 # WoS Porter — Windows ARM64 Porting Agent
 
-AI-powered agents that automatically port open-source x64 Windows applications to native ARM64. Ships as a **GitHub Copilot** VS Code extension and a **Claude Code** plugin.
+AI-powered agents that automatically port open-source x64 Windows applications to native ARM64. Ships as a **GitHub Copilot** VS Code extension, a **Claude Code** plugin, and a **Codex CLI** plugin — use it wherever you work.
 
 ## What It Does
 
@@ -27,6 +27,7 @@ Give it a GitHub repository URL or a local path to an x64 project and it will:
 
 - **[GitHub Copilot (VS Code Extension)](docs/copilot-installation.md)** — Install VSIX, open Copilot Chat, and start porting
 - **[Claude Code (Plugin)](claude-plugin/README.md)** — Install and run as a Claude Code plugin
+- **[Codex CLI (Plugin)](codex-plugin/README.md)** — Install and run as a Codex plugin
 - **[Run in the Cloud (GitHub Actions)](docs/github-actions.md)** — No local ARM64 machine needed; runs on `windows-11-arm` runners. **Best for small, straightforward projects** — use Claude Code or Copilot locally for medium/complex projects.
 
 ## Skip Optimization (Porting Only)

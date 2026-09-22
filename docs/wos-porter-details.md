@@ -4,7 +4,7 @@
 
 | Agent | Role |
 |-------|------|
-| `wos-porter` | Main orchestrator — runs the full 9-phase porting pipeline |
+| `wos-porter` | Main orchestrator — runs the full 8-phase porting pipeline |
 | `wos-analyzer` | Read-only deep scan of a repo for ARM64 readiness |
 | `wos-build-porter` | Modifies build configurations (CMake, MSBuild, Meson, Cargo, etc.) |
 | `wos-code-porter` | Ports x64-specific source code (SIMD, inline asm, arch guards); reads `wos-style.json` for indent/format |

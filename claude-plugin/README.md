@@ -102,6 +102,55 @@ To update later, refresh the marketplace and reinstall:
 /plugin install wos-porter@extension-wos-porter
 ```
 
+## Using with Codex CLI
+
+The same plugin works in **OpenAI Codex CLI** — the `.claude-plugin/marketplace.json` and `claude-plugin/` directory are already in the Codex plugin format.
+
+### Install
+
+1. Add the repo as a Codex marketplace (run once, from any directory):
+
+   ```
+   codex plugin marketplace add C:\path\to\extension-wos-porter
+   ```
+
+   Or from GitHub (once the repo is public):
+
+   ```
+   codex plugin marketplace add qualcomm/extension-wos-porter
+   ```
+
+2. Install the plugin:
+
+   ```
+   codex plugin add wos-porter@extension-wos-porter
+   ```
+
+### Use
+
+```
+@wos-porter https://github.com/owner/repo
+```
+
+Optional flags work exactly as in Claude Code — pass inline in your message:
+
+```
+# Skip NEON optimization:
+@wos-porter https://github.com/owner/repo WOS_SKIP_OPTIMIZE=1
+
+# x64 baseline for gap-targeted optimization:
+@wos-porter https://github.com/owner/repo C:\x64_bench\bench_results.json
+```
+
+### Update
+
+```
+codex plugin marketplace update extension-wos-porter
+codex plugin add wos-porter@extension-wos-porter
+```
+
+---
+
 ## Usage
 
 Run the orchestrator command and pass a GitHub repository URL to port:
